@@ -791,7 +791,7 @@ mod test {
 
 	use bdk_wallet::chain::BlockId;
 	use bdk_wallet::test_utils::{
-		get_test_tr_single_sig_xprv, get_test_wpkh, insert_checkpoint, insert_tx,
+		get_test_tr_single_sig_xprv, insert_checkpoint, insert_tx,
 		receive_output_in_latest_block,
 	};
 	use bitcoin::{BlockHash, OutPoint};
@@ -799,7 +799,7 @@ mod test {
 
 	/// A wallet with one confirmed UTXO per given amount, and its signers.
 	fn funded_wallet(amounts: &[Amount]) -> (BdkWallet, SignersContainer) {
-		let mut wallet = BdkWallet::create_single(get_test_wpkh())
+		let mut wallet = BdkWallet::create_single(get_test_tr_single_sig_xprv())
 			.network(Network::Regtest)
 			.create_wallet_no_persist()
 			.unwrap();
@@ -807,7 +807,7 @@ mod test {
 		for amount in amounts {
 			receive_output_in_latest_block(&mut wallet, *amount);
 		}
-		let signers = wallet.build_signers(get_test_wpkh()).unwrap();
+		let signers = wallet.build_signers(get_test_tr_single_sig_xprv()).unwrap();
 		(wallet, signers)
 	}
 

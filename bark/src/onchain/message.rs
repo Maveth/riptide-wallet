@@ -14,7 +14,7 @@ use super::OnchainWallet;
 
 pub const MESSAGE_MAX_BYTES: usize = 4096;
 
-fn proof_transaction(address: &Address, message: &str) -> anyhow::Result<(Transaction, TxOut)> {
+fn proof_transaction(address: &Address, message: &str) -> anyhow::Result<(Transaction, TxOut, Transaction)> {
 	ensure!(address.script_pubkey().is_p2tr(), "Only Taproot on-chain addresses are supported");
 	ensure!(message.len() <= MESSAGE_MAX_BYTES, "Message exceeds 4096 UTF-8 bytes");
 	let tag = sha256::Hash::hash(b"BIP0322-signed-message");
@@ -40,7 +40,7 @@ fn proof_transaction(address: &Address, message: &str) -> anyhow::Result<(Transa
 		output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::builder()
 			.push_opcode(bitcoin::opcodes::all::OP_RETURN).into_script() }],
 	};
-	Ok((sign, prevout))
+	Ok((sign, prevout, spend))
 }
 
 impl OnchainWallet {
@@ -53,9 +53,10 @@ impl OnchainWallet {
 
 fn sign_with_wallet(wallet: &bdk_wallet::Wallet, signers: &bdk_wallet::signer::SignersContainer, address: &Address, message: &str) -> anyhow::Result<String> {
 	ensure!(wallet.derivation_of_spk(address.script_pubkey()).is_some(), "Address is not owned by this wallet");
-	let (tx, prevout) = proof_transaction(address, message)?;
+	let (tx, prevout, spend) = proof_transaction(address, message)?;
 	let mut psbt = Psbt::from_unsigned_tx(tx)?;
 	psbt.inputs[0].witness_utxo = Some(prevout);
+	psbt.inputs[0].non_witness_utxo = Some(spend);
 	psbt.inputs[0].sighash_type = Some(TapSighashType::Default.into());
 	// Deliberately use the standard signer ONLY for this fixed BIP322 proof.
 	// Real XBT transactions continue to use unified_wallet::sign.
@@ -69,7 +70,7 @@ fn sign_with_wallet(wallet: &bdk_wallet::Wallet, signers: &bdk_wallet::signer::S
 /// Verify standard BIP322-simple key-path Taproot proofs. Accept the historical
 /// unprefixed encoding too, but not legacy compact ECDSA or full proofs.
 pub fn verify_onchain_message(address: &Address, message: &str, signature: &str) -> anyhow::Result<bool> {
-	let (tx, prevout) = proof_transaction(address, message)?;
+	let (tx, prevout, _) = proof_transaction(address, message)?;
 	ensure!(signature.len() <= 256, "Signature is too long");
 	let bytes = STANDARD.decode(signature.strip_prefix("smp").unwrap_or(signature))?;
 	let witness: Witness = deserialize(&bytes)?;

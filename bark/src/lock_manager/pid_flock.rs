@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::{LockGuard, LockManager, PidLockError};
-use super::memory::MemoryLockManager;
+use super::internal_memory::InternalMemoryLockManager;
 
 /// File name used for the datadir-level PID lock.
 pub const LOCK_FILE: &str = "LOCK";
@@ -52,7 +52,7 @@ pub struct FlockPidLockManager {
 	// drop of the manager — at which point the OS releases the lock.
 	_pid_file: File,
 	datadir: PathBuf,
-	in_process: MemoryLockManager,
+	in_process: InternalMemoryLockManager,
 }
 
 impl FlockPidLockManager {
@@ -106,7 +106,7 @@ impl FlockPidLockManager {
 		Ok(Self {
 			_pid_file: file,
 			datadir,
-			in_process: MemoryLockManager::new(),
+			in_process: InternalMemoryLockManager::new(),
 		})
 	}
 
@@ -207,5 +207,17 @@ mod test {
 		assert!(g2.is_some(), "different key should be free");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[tokio::test]
+	async fn separate_wallets_do_not_share_named_locks() {
+		let first_dir = tmp_dir();
+		let second_dir = tmp_dir();
+		let first = FlockPidLockManager::new(&first_dir).unwrap();
+		let second = FlockPidLockManager::new(&second_dir).unwrap();
+		let _first_guard = first.try_lock("same-operation").await.unwrap();
+		let _second_guard = second.try_lock("same-operation").await.unwrap();
+		assert!(first.try_lock("same-operation").await.is_none());
+		assert!(second.try_lock("same-operation").await.is_none());
 	}
 }
