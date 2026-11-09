@@ -156,6 +156,15 @@ pub struct ArkSendEstimateResponse {
 	pub vtxos_spent: Vec<String>,
 }
 
+/// Query parameters for listing the remaining exit transactions.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct RemainingExitTransactionsQuery {
+	/// Comma-separated VTXO ids to inspect. When omitted, every spendable VTXO in the wallet is
+	/// used.
+	pub vtxo_ids: Option<String>,
+}
+
 /// Query parameters for emergency (unilateral) exit fee estimates.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -200,18 +209,45 @@ pub struct EmergencyExitFeeEstimateResponse {
 	pub fee_rate_sat_per_vb: f64,
 	/// The number of exit transactions that still need to be broadcast and CPFP-bumped.
 	pub txs_to_broadcast: usize,
+	/// Whether the wallet's on-chain balance covers `exit_broadcast_fee_sat`.
+	///
+	/// **Deprecated**: the estimate is a funding target and no longer consults
+	/// the wallet's funds. Compare `exit_broadcast_fee_sat` against the on-chain
+	/// balance instead. This field is still populated from the last synced
+	/// on-chain balance for backwards compatibility and will be removed in a
+	/// future release.
+	#[deprecated(note = "compare `exit_broadcast_fee` against the on-chain balance instead")]
+	#[serde(default)]
+	#[cfg_attr(feature = "utoipa", schema(required = true))]
+	pub fundable: bool,
 }
 
-impl From<bark::exit::ExitFeeEstimate> for EmergencyExitFeeEstimateResponse {
-	fn from(e: bark::exit::ExitFeeEstimate) -> Self {
+impl EmergencyExitFeeEstimateResponse {
+	/// Builds the response from an estimate and the wallet's on-chain balance,
+	/// `None` when the wallet has no on-chain wallet to fund the exit from.
+	#[allow(deprecated)] // fundable kept for old clients
+	pub fn new(e: bark::exit::ExitFeeEstimate, onchain_balance: Option<Amount>) -> Self {
 		EmergencyExitFeeEstimateResponse {
 			total_fee: e.total(),
 			exit_broadcast_fee: e.exit_broadcast_fee,
 			claim_fee: e.claim_fee,
 			fee_rate_sat_per_vb: e.fee_rate.to_sat_per_kwu() as f64 / 250.0,
 			txs_to_broadcast: e.txs_to_broadcast,
+			fundable: onchain_balance.map_or(false, |b| b >= e.exit_broadcast_fee),
 		}
 	}
+}
+
+/// Request body for presigning emergency exit chains.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct ExitPresignRequest {
+	/// The IDs of the VTXOs to presign exit chains for, in the order they will be broadcast.
+	/// When omitted, every spendable VTXO in the wallet is used.
+	pub vtxos: Option<Vec<String>>,
+	/// The fee rate to sign the CPFP children at, in sat/vB (fractions allowed). When omitted,
+	/// the current `fast` rate is used.
+	pub fee_rate_sat_per_vb: Option<f64>,
 }
 
 /// Mempool fee rates for on-chain transactions.
@@ -469,14 +505,61 @@ pub struct SendRequest {
 	/// The send recomputes its cost and rejects an increase above this limit before signing.
 	#[serde(default)]
 	pub max_total_sat: Option<u64>,
-	/// The destination can be an Ark address, a BOLT11-invoice, LNURL or a lightning address
+	/// The destination can be an Ark address, a BOLT11 invoice, a BOLT12 offer, a lightning
+	/// address, LNURL, a bitcoin address or a BIP 321 URI
 	pub destination: String,
-	/// The amount to send (in satoshis). Optional for bolt11 invoices. Depending on the
+	/// The amount to send (in satoshis). Optional when the destination carries an amount,
+	/// such as a BOLT11 invoice or a BIP 321 URI with an amount. Depending on the
 	/// `destination`, the wallet must contain this amount plus any fees configured by the server in
 	/// [FeeSchedule](crate::cli::fees::FeeSchedule).
 	pub amount_sat: Option<u64>,
 	/// An optional comment, only supported when paying to lightning addresses
 	pub comment: Option<String>,
+	/// For lightning destinations, how many seconds the Ark server should keep
+	/// trying to pay, capped to the server's maximum. The server picks its
+	/// default when empty.
+	#[serde(default)]
+	pub retry_for_secs: Option<u64>,
+	/// For a destination with several payment methods, such as a BIP 321 URI,
+	/// the kind of method to pay with. When empty, the wallet picks Ark, then
+	/// Lightning, then on-chain.
+	#[serde(default)]
+	pub method: Option<PaymentMethodKind>,
+}
+
+/// A kind of payment method a destination can offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum PaymentMethodKind {
+	/// An Ark address
+	Ark,
+	/// A BOLT11 invoice, BOLT12 offer, lightning address or LNURL
+	Lightning,
+	/// A bitcoin address
+	Onchain,
+}
+
+impl PaymentMethodKind {
+	/// Whether `method` is of this kind.
+	pub fn matches(&self, method: &bark::payment_request::PaymentMethod) -> bool {
+		match self {
+			PaymentMethodKind::Ark => method.is_ark(),
+			PaymentMethodKind::Lightning => method.is_lightning(),
+			PaymentMethodKind::Onchain => method.is_bitcoin(),
+		}
+	}
+}
+
+impl std::fmt::Display for PaymentMethodKind {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let s = match self {
+			PaymentMethodKind::Ark => "ark",
+			PaymentMethodKind::Lightning => "lightning",
+			PaymentMethodKind::Onchain => "onchain",
+		};
+		f.write_str(s)
+	}
 }
 
 #[derive(Serialize, Deserialize)]
@@ -581,6 +664,11 @@ pub struct LightningInvoiceRequest {
 	/// Optional description embedded in the invoice as its memo.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub description: Option<String>,
+	/// Optional number of seconds the invoice can be paid for. Defaults to,
+	/// and cannot exceed, the Ark server's invoice expiry.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "utoipa", schema(minimum = 1))]
+	pub expiry_secs: Option<u64>,
 	/// Optional lightning receive token for authentication of the claim, if
 	/// the server requires one and there are no existing spendable VTXOs to
 	/// prove ownership of.
@@ -598,6 +686,11 @@ pub struct LightningInvoiceForAddressRequest {
 	/// Optional description embedded in the invoice as its memo.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub description: Option<String>,
+	/// Optional number of seconds the invoice can be paid for. Defaults to,
+	/// and cannot exceed, the Ark server's invoice expiry.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "utoipa", schema(minimum = 1))]
+	pub expiry_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -612,6 +705,10 @@ pub struct LightningPayRequest {
 	pub amount_sat: Option<u64>,
 	/// An optional comment, only supported when paying to lightning addresses
 	pub comment: Option<String>,
+	/// How many seconds the Ark server should keep trying to pay, capped to
+	/// the server's maximum. The server picks its default when empty.
+	#[serde(default)]
+	pub retry_for_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]

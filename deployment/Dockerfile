@@ -3,7 +3,7 @@ FROM rust:1.91.0-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev cmake pkg-config protobuf-compiler libssl-dev libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=2
-ARG BARK_VERSION=0.9.3
+ARG BARK_VERSION=0.10.0
 ARG GIT_HASH=unknown
 ENV BARK_VERSION=${BARK_VERSION} GIT_HASH=${GIT_HASH}
 COPY . .

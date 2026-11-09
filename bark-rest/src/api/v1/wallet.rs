@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{Path, Query, State};
@@ -11,13 +12,10 @@ use bitcoin_ext::BlockHeight;
 use utoipa::OpenApi;
 
 use ark::VtxoId;
-use ark::lightning::{Bolt11Invoice, Offer};
 use ark::ProtocolEncoding;
 
-use bark::ImportVtxoError;
-use bark::lnurllib::lightning_address::LightningAddress;
-use bark::lnurllib::lnurl::LnUrl;
-use bark::payment_request::ArkAddressType;
+use bark::{ImportVtxoError, LightningSendOptions};
+use bark::payment_request::PaymentInitOutput;
 use bark::round::RoundStatus;
 use bark::subsystem::RoundMovement;
 use bark::vtxo::VtxoFilter;
@@ -36,6 +34,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/platform-node", get(platform_node))
 		.route("/mnemonic", get(mnemonic))
 		.route("/ark-info", get(ark_info))
+		.route("/debug-info", get(debug_info))
 		.route("/next-round", get(next_round))
 		.route("/addresses/next", post(address))
 		.route("/addresses/index/{index}", get(peek_address))
@@ -69,6 +68,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		create_wallet,
 		mnemonic,
 		ark_info,
+		debug_info,
 		next_round,
 		address,
 		peek_address,
@@ -105,6 +105,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		bark_json::web::CreateWalletResponse,
 		bark_json::web::MnemonicResponse,
 		bark_json::cli::ArkInfo,
+		bark_json::cli::DebugInfo,
 		bark_json::cli::NextRoundStart,
 		bark_json::web::VtxosQuery,
 		bark_json::cli::Balance,
@@ -112,6 +113,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		bark_json::web::EncodedVtxoResponse,
 		bark_json::movements::Movement,
 		bark_json::web::SendRequest,
+		bark_json::web::PaymentMethodKind,
 		bark_json::web::SendResponse,
 		bark_json::web::RefreshRequest,
 		bark_json::web::DelegatedRefreshRequest,
@@ -348,6 +350,30 @@ pub async fn identity(
 		"exit_profile": ark::exit_policy::PAPERCLIP_EXIT_PROFILE,
 		"lightning_enabled": wallet.ark_info().await.ok().flatten().is_some_and(|info| info.funded_lightning),
 	})))
+}
+
+#[utoipa::path(
+	get,
+	path = "/debug-info",
+	summary = "Get wallet debug info",
+	responses(
+		(status = 200, description = "Returns the wallet debug info", body = bark_json::cli::DebugInfo),
+		(status = 500, description = "Internal server error", body = error::InternalServerError)
+	),
+	description = "Returns wallet information that helps to debug issues: the bitcoin \
+		network, the ID of the wallet's server mailbox and the xpub from which all VTXO \
+		keypairs are derived.",
+	tag = "wallet"
+)]
+#[debug_handler]
+pub async fn debug_info(
+	State(state): State<Arc<ServerState>>,
+) -> HandlerResult<Json<bark_json::cli::DebugInfo>> {
+	let wallet = state.require_wallet()?;
+	let info = wallet.debug_info().await
+		.context("Failed to get wallet debug info")?;
+
+	Ok(axum::Json(info.into()))
 }
 
 #[utoipa::path(
@@ -713,19 +739,19 @@ pub async fn pending_rounds(
 	summary = "Send a payment",
 	request_body = bark_json::web::SendRequest,
 	responses(
-		(status = 200, description = "Ark payment completed or Lightning payment initiated", body = bark_json::web::SendResponse),
-		(status = 400, description = "The provided destination is not a valid Ark address, \
-			BOLT11 invoice, BOLT12 offer, or Lightning address", body = error::BadRequestError),
+		(status = 200, description = "Ark payment completed or external payment initiated", body = bark_json::web::SendResponse),
+		(status = 400, description = "The destination is not a valid payment string, has no \
+			valid payment method, or the request lacks a required amount", body = error::BadRequestError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Sends an Ark or Lightning payment to the specified destination. Accepts \
-		an Ark address, BOLT11 invoice, BOLT12 offer, or Lightning address. Ark address \
-		payments are settled instantly via an out-of-round (arkoor) transaction. The \
-		`amount_sat` field is required for Ark addresses and Lightning addresses but \
-		optional for invoices and offers that already encode an amount. Comments are \
-		only supported for Lightning addresses. To send to an on-chain bitcoin address, \
-		use `send-onchain` instead. Lightning payments are asynchronous: this response \
-		is not proof of payment. Poll the returned payment hash for the final outcome.",
+	description = "Sends a payment to the specified destination. Accepts \
+		an Ark address, BOLT11 invoice, BOLT12 offer, Lightning address, LNURL, bitcoin \
+		address, or BIP 321 URI. When the destination offers several payment methods, \
+		`method` picks the kind to pay with; without it the wallet picks Ark, then \
+		Lightning, then on-chain. Ark address payments \
+		are settled instantly via an out-of-round (arkoor) transaction. The `amount_sat` field \
+		is required unless the destination carries an amount. Comments are only supported \
+		for Lightning addresses and LNURL. Lightning payments are asynchronous: poll the returned payment hash for the final outcome.",
 	tag = "wallet"
 )]
 #[debug_handler]
@@ -735,63 +761,73 @@ pub async fn send(
 ) -> HandlerResult<Json<bark_json::web::SendResponse>> {
 	let wallet = state.require_wallet()?;
 
-	let amount = body.amount_sat.map(|a| Amount::from_sat(a));
+	let request = match wallet.parse_payment_request(&body.destination).await {
+		Ok(request) => request,
+		Err(e) => badarg!("invalid destination: {:#}", e),
+	};
 
-	match ArkAddressType::from_str(&body.destination) {
-		Ok(ArkAddressType::Bark(addr)) => {
-			let amount = amount.context("amount missing")?;
-
-			wallet.validate_arkoor_address(&addr).await
-				.badarg("invalid arkoor address")?;
-			log::info!("Sending arkoor payment of {} to address {}", amount, addr);
-			wallet.send_arkoor_payment_with_max_cost(
-				&addr, amount, body.max_total_sat.map(Amount::from_sat),
-			).await?;
-			return Ok(axum::Json(bark_json::web::SendResponse {
-				message: "Payment sent successfully".to_string(),
-				payment_hash: None,
-			}));
+	let option = match body.method {
+		Some(kind) => {
+			let valid = request.options.iter().filter(|o| o.errors.is_empty());
+			match valid.clone().find(|o| kind.matches(&o.method)) {
+				Some(option) => option,
+				None => {
+					let methods = valid.map(|o| o.method.type_str()).collect::<Vec<_>>();
+					badarg!("no valid {} payment method, valid methods are [{}]",
+						kind, methods.join(", "));
+				},
+			}
 		},
-		// Explicitly handle Arkade addresses
-		Ok(ArkAddressType::Arkade(_)) => badarg!("Ark address is for different server"),
-		// Ignore other errors, we want to check payment methods below
-		Err(_) => {}
+		None => match request.default_option() {
+			Some(option) => option,
+			None => {
+				let problems = request.options.iter()
+					.map(|o| {
+						let errors = o.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+						format!("{} ({})", o.method.type_str(), errors.join(", "))
+					})
+					.collect::<Vec<_>>();
+				badarg!("no valid payment method: {}", problems.join(", "));
+			},
+		},
+	};
+	let method = &option.method;
+
+	let amount = body.amount_sat.map(Amount::from_sat).or(request.amount);
+	if amount.is_none() && method.requires_amount() {
+		badarg!("amount is required for {}", method.type_str());
+	}
+	if body.comment.is_some() && !method.supports_comment() {
+		badarg!("comment is not supported for {}", method.type_str());
+	}
+
+	let opts = LightningSendOptions::default()
+		.retry_for(body.retry_for_secs.map(Duration::from_secs));
+	let output = match method {
+		bark::movement::PaymentMethod::Ark(address) => {
+			let amount = amount.badarg("amount is required for Ark payments")?;
+			PaymentInitOutput::Ark(wallet.send_arkoor_payment_with_max_cost(
+				address, amount, body.max_total_sat.map(Amount::from_sat),
+			).await?)
+		},
+		_ => {
+			if body.max_total_sat.is_some() {
+				badarg!("max_total_sat is supported for Ark sends only");
+			}
+			wallet.send_payment_with(method, amount, body.comment, opts).await?
+		},
 	};
 
-	if body.max_total_sat.is_some() { badarg!("max_total_sat is supported for Ark sends only"); }
-
-	let invoice = if let Ok(inv) = Bolt11Invoice::from_str(&body.destination) {
-		if body.comment.is_some() {
-			badarg!("comment is not supported for BOLT-11 invoices");
-		}
-		wallet.pay_lightning_invoice(inv, amount, false).await?
-	} else if let Ok(offer) = Offer::from_str(&body.destination) {
-		if body.comment.is_some() {
-			badarg!("comment is not supported for BOLT-12 offers");
-		}
-		wallet.pay_lightning_offer(offer, amount, false).await?
-	} else if let Ok(addr) = LightningAddress::from_str(&body.destination) {
-		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&addr, amount, body.comment, false).await?
-	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
-		let amount = amount.badarg("amount is required for LNURL")?;
-		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
-	} else if let Ok(addr) = bitcoin::Address::from_str(&body.destination) {
-		let _checked_addr = addr
-			.require_network(wallet.network().await?)
-			.context("bitcoin address is not valid for configured network")?;
-		let _amount = amount.context("amount missing")?;
-
-		return Err(anyhow!("offboards are temporarily disabled").into());
-	} else {
-		badarg!("Argument is not a valid destination. Supported are: \
-			ark addresses, bolt11 invoices, bolt12 offers and lightning addresses");
+	let (message, payment_hash) = match output {
+		PaymentInitOutput::Lightning(invoice) => {
+			("Lightning payment initiated; check payment status for the final outcome".to_string(), Some(invoice.payment_hash()))
+		},
+		PaymentInitOutput::Ark(_) => ("Payment sent successfully".to_string(), None),
+		PaymentInitOutput::Onchain(txid) => {
+			(format!("Payment sent successfully in transaction {}", txid), None)
+		},
 	};
-
-	Ok(axum::Json(bark_json::web::SendResponse {
-		message: "Lightning payment initiated; check payment status for the final outcome".to_string(),
-		payment_hash: Some(invoice.payment_hash()),
-	}))
+	Ok(axum::Json(bark_json::web::SendResponse { message, payment_hash }))
 }
 
 #[utoipa::path(
@@ -997,7 +1033,7 @@ pub async fn refresh_counterparty(
 	summary = "Offboard specific VTXOs",
 	request_body = bark_json::web::OffboardVtxosRequest,
 	responses(
-		(status = 200, description = "Returns the offboard transaction id",
+		(status = 200, description = "Returns the offboard transaction id and the movement id",
 			body = bark_json::cli::OffboardResult),
 		(status = 400, description = "No VTXO IDs provided, or one of the provided \
 			VTXO IDs is invalid, or destination address is invalid", body = error::BadRequestError),
@@ -1041,9 +1077,12 @@ pub async fn offboard_vtxos(
 		vtxo_ids.push(id);
 	}
 
-	let offboard_txid = wallet.offboard_vtxos(vtxo_ids, address).await?;
+	let offboard = wallet.offboard_vtxos(vtxo_ids, address).await?;
 
-	Ok(axum::Json(bark_json::cli::OffboardResult { offboard_txid }))
+	Ok(axum::Json(bark_json::cli::OffboardResult {
+		offboard_txid: offboard.txid,
+		movement_id: offboard.movement_id,
+	}))
 }
 
 #[utoipa::path(
@@ -1052,7 +1091,7 @@ pub async fn offboard_vtxos(
 	summary = "Offboard all VTXOs",
 	request_body = bark_json::web::OffboardAllRequest,
 	responses(
-		(status = 200, description = "Returns the offboard transaction id",
+		(status = 200, description = "Returns the offboard transaction id and the movement id",
 			body = bark_json::cli::OffboardResult),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
@@ -1082,9 +1121,12 @@ pub async fn offboard_all(
 		onchain.write().await.address().await?
 	};
 
-	let offboard_txid = wallet.offboard_all(address).await?;
+	let offboard = wallet.offboard_all(address).await?;
 
-	Ok(axum::Json(bark_json::cli::OffboardResult { offboard_txid }))
+	Ok(axum::Json(bark_json::cli::OffboardResult {
+		offboard_txid: offboard.txid,
+		movement_id: offboard.movement_id,
+	}))
 }
 
 #[utoipa::path(
@@ -1093,7 +1135,7 @@ pub async fn offboard_all(
 	summary = "Send on-chain from Ark balance",
 	request_body = bark_json::web::SendOnchainRequest,
 	responses(
-		(status = 200, description = "Returns the offboard transaction id",
+		(status = 200, description = "Returns the offboard transaction id and the movement id",
 			body = bark_json::cli::OffboardResult),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
@@ -1119,9 +1161,12 @@ pub async fn send_onchain(
 
 	let amount = Amount::from_sat(body.amount_sat);
 
-	let offboard_txid = wallet.send_onchain(addr, amount).await?;
+	let offboard = wallet.send_onchain(addr, amount).await?;
 
-	Ok(axum::Json(bark_json::cli::OffboardResult { offboard_txid }))
+	Ok(axum::Json(bark_json::cli::OffboardResult {
+		offboard_txid: offboard.txid,
+		movement_id: offboard.movement_id,
+	}))
 }
 
 #[utoipa::path(

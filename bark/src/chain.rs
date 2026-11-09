@@ -2,8 +2,12 @@
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::Arc;
+#[cfg(target_arch = "wasm32")]
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -36,6 +40,53 @@ use crate::daemon::tip_watcher::{TipSource, TipWatcher};
 const FEE_RATE_TARGET_CONF_FAST: u16 = 1;
 const FEE_RATE_TARGET_CONF_REGULAR: u16 = 3;
 const FEE_RATE_TARGET_CONF_SLOW: u16 = 6;
+
+/// Timer the esplora client uses to back off between retries of a 429, 500
+/// or 503 response.
+///
+/// The client's default sleeper is `tokio::time::sleep`, which panics on
+/// wasm32 because there is no tokio time driver there. Routing the sleep
+/// through [bark_runtime] picks the right timer for each platform.
+#[derive(Debug, Clone, Copy)]
+pub struct BarkSleeper;
+
+impl esplora_client::Sleeper for BarkSleeper {
+	#[cfg(not(target_arch = "wasm32"))]
+	type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
+	#[cfg(target_arch = "wasm32")]
+	type Sleep = WasmSleep;
+
+	fn sleep(dur: Duration) -> Self::Sleep {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			Box::pin(bark_runtime::sleep(dur))
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			WasmSleep(Box::pin(bark_runtime::sleep(dur)))
+		}
+	}
+}
+
+/// The browser sleep future, marked `Send` for `bdk_esplora`, which requires
+/// a `Send` sleeper future on every target. The future holds JS timer
+/// handles and is not `Send` by itself.
+#[cfg(target_arch = "wasm32")]
+pub struct WasmSleep(Pin<Box<dyn Future<Output = ()>>>);
+
+// SAFETY: wasm32-unknown-unknown runs on a single thread, so the future is
+// never moved to or polled from another thread.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for WasmSleep {}
+
+#[cfg(target_arch = "wasm32")]
+impl Future for WasmSleep {
+	type Output = ();
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+		self.0.as_mut().poll(cx)
+	}
+}
 
 /// Coalesce bursts of `tip()` calls within the same `Wallet::sync()` cycle
 /// (parallel sub-syncs each fetch tip, and the exit progress state machine
@@ -99,7 +150,7 @@ pub enum ChainSourceClient {
 		rpc: BitcoindClient,
 		sync: BitcoinRpcClient,
 	},
-	Esplora(esplora_client::AsyncClient),
+	Esplora(esplora_client::AsyncClient<BarkSleeper>),
 }
 
 impl ChainSourceClient {
@@ -221,7 +272,8 @@ impl ChainSource {
 	#[cfg(all(test, feature = "sqlite"))]
 	pub(crate) fn offline_for_test(network: Network) -> Self {
 		let inner = ChainSourceClient::Esplora(
-			esplora_client::Builder::new("http://127.0.0.1:1").build_async()
+			esplora_client::Builder::new("http://127.0.0.1:1")
+				.build_async_with_sleeper::<BarkSleeper>()
 				.expect("esplora client builds without connecting"),
 		);
 		let fee = FeeRate::BROADCAST_MIN;
@@ -337,7 +389,7 @@ impl ChainSource {
 				if let Some(proxy) = proxy {
 					builder = builder.proxy(proxy);
 				}
-				builder.build_async()
+				builder.build_async_with_sleeper::<BarkSleeper>()
 					.with_context(|| format!("failed to create esplora client for url {}", url))?
 			}), None),
 		};
@@ -519,14 +571,14 @@ impl ChainSource {
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
-				let entry: rpc::json::GetMempoolEntryResult = rpc.call_raw(
+				let entry: rpc::MempoolEntryAncestors = rpc.call_raw(
 					"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
 				).await?;
-				let err = || anyhow!("missing weight parameter from getmempoolentry");
+				let err = || anyhow!("invalid ancestorsize from getmempoolentry");
 
 				result.total_fee = entry.fees.ancestor;
-				result.total_weight = Weight::from_wu(entry.weight.ok_or_else(err)?) +
-					Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
+				// ancestorsize includes the tx itself
+				result.total_weight = Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
 			},
 			ChainSourceClient::Esplora(client) => {
 				// We should first verify the transaction is in the mempool to maintain the same
@@ -575,6 +627,10 @@ impl ChainSource {
 
 	/// For each provided outpoint, fetches the ID of any confirmed or unconfirmed in which the
 	/// outpoint is spent.
+	///
+	#[deprecated(
+		note = "This function is heavily inefficient on bitcoind and should be avoided if possible.",
+	)]
 	pub async fn txs_spending_inputs<T: IntoIterator<Item = OutPoint>>(
 		&self,
 		outpoints: T,

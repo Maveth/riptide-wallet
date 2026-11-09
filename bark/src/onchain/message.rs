@@ -47,11 +47,11 @@ impl OnchainWallet {
 	/// Sign exact UTF-8 bytes with an owned, known Taproot address. No wallet
 	/// state is changed and nothing is broadcast, even when the wallet is empty.
 	pub fn sign_onchain_message(&self, address: &Address, message: &str) -> anyhow::Result<String> {
-		sign_with_wallet(&self.inner, address, message)
+		sign_with_wallet(&self.inner, &self.signers, address, message)
 	}
 }
 
-fn sign_with_wallet(wallet: &bdk_wallet::Wallet, address: &Address, message: &str) -> anyhow::Result<String> {
+fn sign_with_wallet(wallet: &bdk_wallet::Wallet, signers: &bdk_wallet::signer::SignersContainer, address: &Address, message: &str) -> anyhow::Result<String> {
 	ensure!(wallet.derivation_of_spk(address.script_pubkey()).is_some(), "Address is not owned by this wallet");
 	let (tx, prevout) = proof_transaction(address, message)?;
 	let mut psbt = Psbt::from_unsigned_tx(tx)?;
@@ -59,7 +59,7 @@ fn sign_with_wallet(wallet: &bdk_wallet::Wallet, address: &Address, message: &st
 	psbt.inputs[0].sighash_type = Some(TapSighashType::Default.into());
 	// Deliberately use the standard signer ONLY for this fixed BIP322 proof.
 	// Real XBT transactions continue to use unified_wallet::sign.
-	ensure!(wallet.sign(&mut psbt, Default::default())?, "Unable to sign address proof");
+	ensure!(wallet.sign_with_signers(&mut psbt, &[signers], Default::default())?, "Unable to sign address proof");
 	let witness = psbt.inputs[0].final_script_witness.as_ref().context("Missing proof witness")?;
 	let signature = format!("smp{}", STANDARD.encode(serialize(witness)));
 	ensure!(verify_onchain_message(address, message, &signature)?, "Generated proof did not verify");
@@ -86,6 +86,7 @@ pub fn verify_onchain_message(address: &Address, message: &str, signature: &str)
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use bitcoin_ext::bdk::WalletExt;
 	use std::str::FromStr;
 	use bdk_wallet::{KeychainKind, Wallet};
 	use bitcoin::{bip32::Xpriv, Network};
@@ -106,10 +107,11 @@ mod tests {
 		let master = Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap();
 		let mut wallet = Wallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
 			.network(Network::Regtest).create_wallet_no_persist().unwrap();
+		let signers = wallet.build_signers(bdk_wallet::template::Bip86(master, KeychainKind::External)).unwrap();
 		let address = wallet.reveal_next_address(KeychainKind::External).address;
 		let other = wallet.reveal_next_address(KeychainKind::External).address;
 		for message in ["", "Paperclip pool\nnonce: 123\n", " UTF-8: Ã© æµ‹è¯• "] {
-			let proof = sign_with_wallet(&wallet, &address, message).unwrap();
+			let proof = sign_with_wallet(&wallet, &signers, &address, message).unwrap();
 			assert!(proof.starts_with("smp"));
 			assert!(verify_onchain_message(&address, message, &proof).unwrap());
 			assert!(!verify_onchain_message(&other, message, &proof).unwrap());
@@ -117,7 +119,7 @@ mod tests {
 		}
 		assert_eq!(wallet.balance().total(), Amount::ZERO);
 		let foreign = Address::from_str("bc1pss0zhytly75awhm6x2hhvd5lnzv3vssgrf9axfheq8ldyzn88ges79fler").unwrap().require_network(Network::Bitcoin).unwrap();
-		assert!(sign_with_wallet(&wallet, &foreign, "proof").is_err());
-		assert!(sign_with_wallet(&wallet, &address, &"x".repeat(MESSAGE_MAX_BYTES + 1)).is_err());
+		assert!(sign_with_wallet(&wallet, &signers, &foreign, "proof").is_err());
+		assert!(sign_with_wallet(&wallet, &signers, &address, &"x".repeat(MESSAGE_MAX_BYTES + 1)).is_err());
 	}
 }

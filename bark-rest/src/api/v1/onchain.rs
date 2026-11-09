@@ -76,7 +76,7 @@ pub struct OnchainApiDoc;
 
 #[utoipa::path(post, path = "/message/sign", tag = "onchain",
 	request_body = bark_json::web::OnchainMessageRequest,
-	responses((status = 200, body = bark_json::web::OnchainMessageProof)),
+	responses((status = 200, description = "Signed address ownership proof", body = bark_json::web::OnchainMessageProof)),
 	summary = "Sign an on-chain Taproot address ownership message using BIP322-simple")]
 pub async fn onchain_message_sign(
 	State(state): State<Arc<ServerState>>,
@@ -97,7 +97,7 @@ pub async fn onchain_message_sign(
 
 #[utoipa::path(post, path = "/message/verify", tag = "onchain",
 	request_body = bark_json::web::OnchainMessageVerifyRequest,
-	responses((status = 200, body = bark_json::web::OnchainMessageVerification)),
+	responses((status = 200, description = "Address ownership proof verification result", body = bark_json::web::OnchainMessageVerification)),
 	summary = "Verify a BIP322-simple Taproot address ownership message")]
 pub async fn onchain_message_verify(
 	State(state): State<Arc<ServerState>>,

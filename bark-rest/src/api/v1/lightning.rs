@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -9,6 +10,8 @@ use anyhow::Context;
 use utoipa::OpenApi;
 
 use ark::lightning::{Invoice, Offer};
+use bark::LightningSendOptions;
+use bark::lightning_invoice::Bolt11Invoice;
 use bark::lnurllib::lightning_address::LightningAddress;
 use bark::lnurllib::lnurl::LnUrl;
 
@@ -64,7 +67,8 @@ pub fn router() -> Router<Arc<ServerState>> {
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Generates a new BOLT11 invoice for the specified amount via the Ark server, \
-		creating a pending Lightning receive.",
+		creating a pending Lightning receive. The invoice expires after `expiry_secs` if given, \
+		otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
 	tag = "lightning"
 )]
 #[debug_handler]
@@ -75,7 +79,12 @@ pub async fn generate_invoice(
 	let wallet = state.require_wallet()?;
 
 	let amount = Amount::from_sat(body.amount_sat);
-	let invoice = wallet.bolt11_invoice(amount, body.description, body.token).await
+	let invoice = wallet.bolt11_invoice_builder()
+		.amount(amount)
+		.description(body.description)
+		.expiry(body.expiry_secs.map(Duration::from_secs))
+		.token(body.token)
+		.build().await
 		.context("Failed to create invoice")?;
 
 	Ok(axum::Json(bark_json::cli::InvoiceInfo {
@@ -94,7 +103,9 @@ pub async fn generate_invoice(
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning \
-		receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox.",
+		receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. \
+		The invoice expires after `expiry_secs` if given, otherwise after the Ark server's \
+		invoice expiry, which is also the longest it accepts.",
 	tag = "lightning"
 )]
 #[debug_handler]
@@ -109,7 +120,12 @@ pub async fn generate_invoice_for_address(
 		.badarg("address is not a valid Ark address")?;
 	wallet.validate_arkoor_address(&address).await
 		.badarg("invalid arkoor address")?;
-	let invoice = wallet.bolt11_invoice_for_address(amount, address, body.description, None).await
+	let invoice = wallet.bolt11_invoice_builder()
+		.amount(amount)
+		.claim_destination(address)
+		.description(body.description)
+		.expiry(body.expiry_secs.map(Duration::from_secs))
+		.build().await
 		.context("Failed to create invoice for address")?;
 
 	Ok(axum::Json(bark_json::cli::InvoiceInfo {
@@ -131,10 +147,9 @@ pub async fn generate_invoice_for_address(
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Returns the status of a specified Lightning receive, identified by its \
-		payment hash, invoice string, or preimage. The response tracks progress through \
-		timestamps: `htlc_vtxos` is populated once HTLCs are created by the Ark server, \
-		`preimage_revealed_at` records when the preimage was sent, and `finished_at` \
-		indicates the receive has settled or been canceled.",
+		payment hash, invoice string, or preimage. `state` tracks its progress and \
+		`settled_at` records when it settled. A receive that ended without settling, \
+		for example a canceled one, is no longer known and returns 404.",
 	tag = "lightning"
 )]
 #[debug_handler]
@@ -155,7 +170,7 @@ pub async fn get_receive_status(
 	};
 
 	let state = wallet.lightning_receive_state(payment_hash).await
-		.context("Failed to get lightning receive status")?;
+		.not_found([payment_hash], "Lightning receive not found")?;
 	Ok(axum::Json(bark_json::cli::LightningReceiveInfo::from_state(&state)))
 }
 
@@ -294,23 +309,25 @@ pub async fn pay(
 	let wallet = state.require_wallet()?;
 
 	let amount = body.amount_sat.map(|a| Amount::from_sat(a));
+	let opts = LightningSendOptions::default()
+		.retry_for(body.retry_for_secs.map(Duration::from_secs));
 
 	let invoice = if let Ok(invoice) = Invoice::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for Lightning invoices");
 		}
-		wallet.pay_lightning_invoice(invoice, amount, false).await?
+		wallet.pay_lightning_invoice_with(invoice, amount, opts).await?
 	} else if let Ok(offer) = Offer::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-12 offers");
 		}
-		wallet.pay_lightning_offer(offer, amount, false).await?
+		wallet.pay_lightning_offer_with(offer, amount, opts).await?
 	} else if let Ok(lnaddr) = LightningAddress::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&lnaddr, amount, body.comment, false).await?
+		wallet.pay_lightning_address_with(&lnaddr, amount, body.comment, opts).await?
 	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for LNURL")?;
-		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
+		wallet.pay_lnurl_with(&lnurl, amount, body.comment, opts).await?
 	} else {
 		badarg!("argument is not a valid BOLT-11 or BOLT-12 invoice, BOLT-12 offer, Lightning address or LNURL");
 	};

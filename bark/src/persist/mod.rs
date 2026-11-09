@@ -206,6 +206,23 @@ pub trait BarkPersister: Send + Sync + 'static {
 		update: MovementUpdate,
 	) -> anyhow::Result<(MovementId, bool)>;
 
+	/// Looks up the movement owned by `action_id`, if the action created one.
+	///
+	/// The index is written by [BarkPersister::get_or_create_movement_for_action]
+	/// and outlives the action's checkpoint, so the movement of an action that
+	/// already finished can still be found.
+	///
+	/// Returns:
+	/// - `Ok(Some(id))` if the action owns a movement.
+	/// - `Ok(None)` if no movement is indexed under `action_id`.
+	///
+	/// Errors:
+	/// - If the query fails.
+	async fn get_movement_id_by_action(
+		&self,
+		action_id: &str,
+	) -> anyhow::Result<Option<MovementId>>;
+
 	/// Persists the given movement state.
 	///
 	/// Parameters:
@@ -422,6 +439,18 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// Errors:
 	/// - Returns an error if the mapping cannot be stored.
 	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()>;
+
+	/// Store many derivation index to [PublicKey] mappings at once.
+	///
+	/// Same semantics as [Self::store_vtxo_key] for each pair. The default
+	/// stores them one by one; backends should override this with a single
+	/// transaction, since recovery can store up to a hundred thousand keys.
+	async fn store_vtxo_keys(&self, keys: &[(u32, PublicKey)]) -> anyhow::Result<()> {
+		for (index, public_key) in keys {
+			self.store_vtxo_key(*index, *public_key).await?;
+		}
+		Ok(())
+	}
 
 	/// Get the last revealed/used [Vtxo] key index.
 	///

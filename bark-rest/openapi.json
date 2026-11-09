@@ -11,7 +11,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.7.1"
+    "version": "0.8.1"
   },
   "paths": {
     "/api/v1/bitcoin/tip": {
@@ -154,7 +154,7 @@
           "exits"
         ],
         "summary": "Cancel an exit",
-        "description": "Aborts an in-progress emergency exit while it is still safe to do so—before its final transaction has been broadcast. Exit transactions are ordered topologically and only the final one moves the VTXO on-chain, so an exit can still be canceled even after its shared ancestor transactions are in the mempool or a block. Canceling leaves the VTXO spendable, so a fresh exit can be started for it later. Before canceling, the endpoint verifies directly against the chain that the final transaction hasn't been broadcast; nothing is rebroadcast in the process. Canceling an already-canceled exit succeeds as a no-op, so retries are safe. Note the daemon auto-progresses exits at the cadence defined by `SLOW_INTERVAL`, so cancel promptly once an exit reaches a state you no longer wish to pursue.",
+        "description": "Aborts an in-progress emergency exit while it is still safe to do so—before its final transaction has been broadcast. Exit transactions are ordered topologically and only the final one moves the VTXO on-chain, so an exit can still be canceled even after its shared ancestor transactions are in the mempool or a block. Canceling leaves the VTXO spendable, so a fresh exit can be started for it later. Before canceling, the endpoint verifies directly against the chain that the final transaction hasn't been broadcast; nothing is rebroadcast in the process. Canceling an already-canceled exit succeeds as a no-op, so retries are safe. Note the daemon auto-progresses exits at the interval set by the `daemon_sync_interval_secs` config setting, so cancel promptly once an exit reaches a state you no longer wish to pursue.",
         "operationId": "exit_cancel",
         "parameters": [
           {
@@ -397,6 +397,58 @@
         }
       }
     },
+    "/api/v1/exits/presign": {
+      "post": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "Presign emergency exit chains",
+        "description": "Signs, without broadcasting, the CPFP child of every transaction that still needs to be broadcast to unilaterally (emergency) exit the specified VTXOs, for as long as the wallet's confirmed on-chain funds last. The result is a self-contained broadcast plan meant for later execution by any independent party: broadcast all of a wave's `(exit, child)` packages together, wait for every one to confirm, then move to the next wave—each wave's children spend change confirmed by the previous wave. Exit transactions already in the mempool are listed in the first wave's `in_mempool`. Each exit's `status` reports whether its packages are `fully-signed` (`exited_in_wave` names the wave whose confirmation completes the exit), `partially-signed` (confirmed funds ran out mid-chain; `last_wave` holds the last signed package and the unfunded tail is listed under `unsigned`), or `unsigned`. How much more funding a partial result would need is not reported: adding funds changes which coins the next child selects and therefore what it costs. Use `GET /exits/fee` for the remaining broadcast cost. Presigning reserves no funds, so a later spend from the on-chain wallet can invalidate the remaining children. It does reveal the on-chain addresses the children pay their change to, so one wallet sync recognizes the whole chain once broadcast, and repeat calls against unchanged funds re-derive the same addresses.",
+        "operationId": "exit_presign",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExitPresignRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returns the presigned exit packages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresignedExits"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A VTXO is unknown, non-standard, already exited, or already spent, or a parameter is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/exits/progress": {
       "post": {
         "tags": [
@@ -439,13 +491,66 @@
         }
       }
     },
+    "/api/v1/exits/remaining": {
+      "get": {
+        "tags": [
+          "exits"
+        ],
+        "summary": "List remaining exit transactions",
+        "description": "Lists every exit transaction of the given VTXOs not yet confirmed on-chain: per VTXO, the transaction ids it needs confirmed in broadcast order, plus each transaction exactly once with parents before children. Read-only: nothing is signed and the wallet is never touched, so this works whether or not an exit has been started. Transaction statuses reflect the last exit sync; the daemon refreshes them at the cadence of `SLOW_INTERVAL`, and `POST /exits/progress` forces a refresh. Use `POST /exits/presign` to sign CPFP children for the listed transactions.",
+        "operationId": "remaining_exit_transactions",
+        "parameters": [
+          {
+            "name": "vtxo_ids",
+            "in": "query",
+            "description": "Comma-separated VTXO ids to inspect; omit to inspect the entire wallet",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Returns the remaining exit transactions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemainingExitTransactions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A VTXO is unknown, non-standard, already exited, or already spent, or a parameter is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/exits/start/all": {
       "post": {
         "tags": [
           "exits"
         ],
         "summary": "Start exit for all VTXOs",
-        "description": "Registers all wallet VTXOs for emergency exit. The daemon automatically progresses registered exits in the background at the cadence defined by `SLOW_INTERVAL`, creating and broadcasting the required transactions in sequence. Once all exit transactions are confirmed and the timelock has elapsed, call `claim` to sweep the resulting outputs to an on-chain address.",
+        "description": "Registers all wallet VTXOs for emergency exit. The daemon automatically progresses registered exits in the background at the interval set by the `daemon_sync_interval_secs` config setting, creating and broadcasting the required transactions in sequence. Once all exit transactions are confirmed and the timelock has elapsed, call `claim` to sweep the resulting outputs to an on-chain address.",
         "operationId": "exit_start_all",
         "responses": {
           "200": {
@@ -477,7 +582,7 @@
           "exits"
         ],
         "summary": "Start exit for specific VTXOs",
-        "description": "Registers the specified VTXOs for emergency exit. The daemon automatically progresses registered exits in the background at the cadence defined by `SLOW_INTERVAL`, creating and broadcasting the required transactions in sequence. Once all exit transactions are confirmed and the timelock has elapsed, call `claim` to sweep the resulting outputs to an on-chain address.",
+        "description": "Registers the specified VTXOs for emergency exit. The daemon automatically progresses registered exits in the background at the interval set by the `daemon_sync_interval_secs` config setting, creating and broadcasting the required transactions in sequence. Once all exit transactions are confirmed and the timelock has elapsed, call `claim` to sweep the resulting outputs to an on-chain address.",
         "operationId": "exit_start_vtxos",
         "requestBody": {
           "content": {
@@ -1535,7 +1640,7 @@
           "lightning"
         ],
         "summary": "Create a BOLT11 invoice",
-        "description": "Generates a new BOLT11 invoice for the specified amount via the Ark server, creating a pending Lightning receive.",
+        "description": "Generates a new BOLT11 invoice for the specified amount via the Ark server, creating a pending Lightning receive. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
         "operationId": "generate_invoice",
         "requestBody": {
           "content": {
@@ -1577,7 +1682,7 @@
           "lightning"
         ],
         "summary": "Create a BOLT11 invoice for an Ark address",
-        "description": "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox.",
+        "description": "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
         "operationId": "generate_invoice_for_address",
         "requestBody": {
           "content": {
@@ -1629,7 +1734,7 @@
           "lightning"
         ],
         "summary": "Get receive status",
-        "description": "Returns the status of a specified Lightning receive, identified by its payment hash, invoice string, or preimage. The response tracks progress through timestamps: `htlc_vtxos` is populated once HTLCs are created by the Ark server, `preimage_revealed_at` records when the preimage was sent, and `finished_at` indicates the receive has settled or been canceled.",
+        "description": "Returns the status of a specified Lightning receive, identified by its payment hash, invoice string, or preimage. `state` tracks its progress and `settled_at` records when it settled. A receive that ended without settling, for example a canceled one, is no longer known and returns 404.",
         "operationId": "get_receive_status",
         "parameters": [
           {
@@ -1957,7 +2062,7 @@
           "notifications"
         ],
         "summary": "Create a websocket ticket",
-        "description": "Creates a single-use ticket that authenticates a websocket connection at `ws://<host>/api/v1/notifications/ws?ticket=<ticket>`. The ticket must be used within 10 minutes of creation; the resulting websocket connection is long-lived.",
+        "description": "Creates a single-use ticket that authenticates a websocket connection at `ws://<host>/api/v1/notifications/ws?ticket=<ticket>`. The ticket must be used within 10 minutes of creation; the resulting websocket connection is long-lived. The handshake answers 401 for an unknown, already used or expired ticket, and 422 when no wallet is loaded. The ticket is consumed in all of these cases.",
         "operationId": "websocket_ticket",
         "responses": {
           "200": {
@@ -2108,7 +2213,7 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "Signed address ownership proof",
             "content": {
               "application/json": {
                 "schema": {
@@ -2139,7 +2244,7 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "Address ownership proof verification result",
             "content": {
               "application/json": {
                 "schema": {
@@ -2698,6 +2803,38 @@
         }
       }
     },
+    "/api/v1/wallet/debug-info": {
+      "get": {
+        "tags": [
+          "wallet"
+        ],
+        "summary": "Get wallet debug info",
+        "description": "Returns wallet information that helps to debug issues: the bitcoin network, the ID of the wallet's server mailbox and the xpub from which all VTXO keypairs are derived.",
+        "operationId": "debug_info",
+        "responses": {
+          "200": {
+            "description": "Returns the wallet debug info",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DebugInfo"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/wallet/history": {
       "get": {
         "tags": [
@@ -2939,7 +3076,7 @@
         },
         "responses": {
           "200": {
-            "description": "Returns the offboard transaction id",
+            "description": "Returns the offboard transaction id and the movement id",
             "content": {
               "application/json": {
                 "schema": {
@@ -2981,7 +3118,7 @@
         },
         "responses": {
           "200": {
-            "description": "Returns the offboard transaction id",
+            "description": "Returns the offboard transaction id and the movement id",
             "content": {
               "application/json": {
                 "schema": {
@@ -3255,7 +3392,7 @@
           "wallet"
         ],
         "summary": "Send a payment",
-        "description": "Sends an Ark or Lightning payment to the specified destination. Accepts an Ark address, BOLT11 invoice, BOLT12 offer, or Lightning address. Ark address payments are settled instantly via an out-of-round (arkoor) transaction. The `amount_sat` field is required for Ark addresses and Lightning addresses but optional for invoices and offers that already encode an amount. Comments are only supported for Lightning addresses. To send to an on-chain bitcoin address, use `send-onchain` instead. Lightning payments are asynchronous: this response is not proof of payment. Poll the returned payment hash for the final outcome.",
+        "description": "Sends a payment to the specified destination. Accepts an Ark address, BOLT11 invoice, BOLT12 offer, Lightning address, LNURL, bitcoin address, or BIP 321 URI. When the destination offers several payment methods, `method` picks the kind to pay with; without it the wallet picks Ark, then Lightning, then on-chain. Ark address payments are settled instantly via an out-of-round (arkoor) transaction. The `amount_sat` field is required unless the destination carries an amount. Comments are only supported for Lightning addresses and LNURL. Lightning payments are asynchronous: poll the returned payment hash for the final outcome.",
         "operationId": "send",
         "requestBody": {
           "content": {
@@ -3269,7 +3406,7 @@
         },
         "responses": {
           "200": {
-            "description": "Ark payment completed or Lightning payment initiated",
+            "description": "Ark payment completed or external payment initiated",
             "content": {
               "application/json": {
                 "schema": {
@@ -3279,7 +3416,7 @@
             }
           },
           "400": {
-            "description": "The provided destination is not a valid Ark address, BOLT11 invoice, BOLT12 offer, or Lightning address",
+            "description": "The destination is not a valid payment string, has no valid payment method, or the request lacks a required amount",
             "content": {
               "application/json": {
                 "schema": {
@@ -3321,7 +3458,7 @@
         },
         "responses": {
           "200": {
-            "description": "Returns the offboard transaction id",
+            "description": "Returns the offboard transaction id and the movement id",
             "content": {
               "application/json": {
                 "schema": {
@@ -3608,6 +3745,7 @@
         "required": [
           "exit_profile",
           "funded_lightning",
+          "economical_transfers",
           "network",
           "server_pubkey",
           "mailbox_pubkey",
@@ -3628,6 +3766,9 @@
           "vtxo_expiry_delta"
         ],
         "properties": {
+          "economical_transfers": {
+            "type": "boolean"
+          },
           "exit_profile": {
             "type": "integer",
             "format": "int32",
@@ -3869,7 +4010,7 @@
           "pending_exit_sat": {
             "type": "integer",
             "format": "int64",
-            "description": "Sats held in VTXOs whose unilateral exit has committed on-chain but which\nhaven't yet been drained to the onchain wallet: their state is\n[`VtxoStateInfo::Exited`] and their exit has not reached\n[`ExitStateKind::Claimed`].",
+            "description": "Sats held in VTXOs whose unilateral exit has committed on-chain but which\nhaven't yet been drained to the onchain wallet: their state is\n[`crate::primitives::VtxoStateInfo::Exited`] and their exit has not reached\n[`crate::exit::ExitStateKind::Claimed`].",
             "minimum": 0
           },
           "pending_in_round_sat": {
@@ -4105,6 +4246,13 @@
       "ChainSourceConfig": {
         "oneOf": [
           {
+            "type": "string",
+            "description": "Use the connection supplied by the local server package.",
+            "enum": [
+              "platform"
+            ]
+          },
+          {
             "type": "object",
             "description": "Use a bitcoind RPC server",
             "required": [
@@ -4163,10 +4311,10 @@
           "fee_info": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/FeeInfo"
               },
               {
-                "$ref": "#/components/schemas/FeeInfo"
+                "type": "null"
               }
             ]
           },
@@ -4223,11 +4371,11 @@
           "chain_source": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChainSourceConfig",
                 "description": "The chain source to use for the wallet.\nOptional when a config.toml already exists in the datadir or when\nthe network has a default chain source (mainnet, signet and\nmutinynet)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -4266,6 +4414,29 @@
         "properties": {
           "fingerprint": {
             "type": "string"
+          }
+        }
+      },
+      "DebugInfo": {
+        "type": "object",
+        "description": "Wallet information that helps to debug issues.",
+        "required": [
+          "network",
+          "mailbox_id",
+          "vtxo_xpub"
+        ],
+        "properties": {
+          "mailbox_id": {
+            "type": "string",
+            "description": "The ID of the wallet's server mailbox"
+          },
+          "network": {
+            "type": "string",
+            "description": "The bitcoin network the wallet operates on"
+          },
+          "vtxo_xpub": {
+            "type": "string",
+            "description": "The xpub from which all VTXO keypairs are derived"
           }
         }
       },
@@ -4337,7 +4508,8 @@
           "claim_fee_sat",
           "total_fee_sat",
           "fee_rate_sat_per_vb",
-          "txs_to_broadcast"
+          "txs_to_broadcast",
+          "fundable"
         ],
         "properties": {
           "claim_fee_sat": {
@@ -4356,6 +4528,11 @@
             "type": "number",
             "format": "double",
             "description": "The fee rate the exit-broadcast leg was priced at (sat/vB), before the fee margin. Unless\nan explicit fee rate was supplied, the claim leg is priced separately at the chain's\n`regular` rate."
+          },
+          "fundable": {
+            "type": "boolean",
+            "description": "Whether the wallet's on-chain balance covers `exit_broadcast_fee_sat`.\n\n**Deprecated**: the estimate is a funding target and no longer consults\nthe wallet's funds. Compare `exit_broadcast_fee_sat` against the on-chain\nbalance instead. This field is still populated from the last synced\non-chain balance for backwards compatibility and will be removed in a\nfuture release.",
+            "deprecated": true
           },
           "total_fee_sat": {
             "type": "integer",
@@ -4530,10 +4707,10 @@
           "last_scanned_block": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/BlockRef"
               },
               {
-                "$ref": "#/components/schemas/BlockRef"
+                "type": "null"
               }
             ]
           },
@@ -5275,6 +5452,30 @@
           }
         ]
       },
+      "ExitPresignRequest": {
+        "type": "object",
+        "description": "Request body for presigning emergency exit chains.",
+        "properties": {
+          "fee_rate_sat_per_vb": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The fee rate to sign the CPFP children at, in sat/vB (fractions allowed). When omitted,\nthe current `fast` rate is used."
+          },
+          "vtxos": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The IDs of the VTXOs to presign exit chains for, in the order they will be broadcast.\nWhen omitted, every spendable VTXO in the wallet is used."
+          }
+        }
+      },
       "ExitProcessingState": {
         "type": "object",
         "required": [
@@ -5339,11 +5540,11 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ExitError",
                 "description": "Top-level error that prevented progress from running cleanly this round. Per-exit\nproblems live on each `ExitProgressStatus`; this slot is for failures that can't\nbe attributed to a specific VTXO (e.g. the chain source becoming unavailable, or\nthe exit manager failing to refresh its view of pending transactions)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5366,11 +5567,11 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ExitError",
                 "description": "Any error that occurred during the exit process"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5660,11 +5861,11 @@
           "child": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChildTransactionInfo",
                 "description": "The child transaction used to spend, and thus confirm, the exit anchor output"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5734,10 +5935,10 @@
               "confirmed_in": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/BlockRef"
                   },
                   {
-                    "$ref": "#/components/schemas/BlockRef"
+                    "type": "null"
                   }
                 ]
               },
@@ -6132,6 +6333,15 @@
               "null"
             ],
             "description": "Optional description embedded in the invoice as its memo."
+          },
+          "expiry_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional number of seconds the invoice can be paid for. Defaults to,\nand cannot exceed, the Ark server's invoice expiry.",
+            "minimum": 1
           }
         }
       },
@@ -6153,6 +6363,15 @@
               "null"
             ],
             "description": "Optional description embedded in the invoice as its memo."
+          },
+          "expiry_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional number of seconds the invoice can be paid for. Defaults to,\nand cannot exceed, the Ark server's invoice expiry.",
+            "minimum": 1
           },
           "token": {
             "type": [
@@ -6208,6 +6427,15 @@
           "destination": {
             "type": "string",
             "description": "The invoice, offer, or lightning address to pay"
+          },
+          "retry_for_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many seconds the Ark server should keep trying to pay, capped to\nthe server's maximum. The server picks its default when empty.",
+            "minimum": 0
           }
         }
       },
@@ -6326,10 +6554,22 @@
             "description": "The timestamp at which the receive settled, if it has."
           },
           "state": {
-            "type": "string",
-            "description": "Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,\n`preimage-revealed`, `delivering`, or `settled`."
+            "$ref": "#/components/schemas/LightningReceiveStateKind",
+            "description": "Lifecycle phase of the receive"
           }
         }
+      },
+      "LightningReceiveStateKind": {
+        "type": "string",
+        "description": "Lifecycle phase of a lightning receive.",
+        "enum": [
+          "awaiting-payment",
+          "htlcs-ready",
+          "preimage-revealed",
+          "delivering",
+          "settled",
+          "other"
+        ]
       },
       "LightningSendFees": {
         "type": "object",
@@ -6387,10 +6627,26 @@
             "description": "The payment preimage, revealed once the payment succeeded."
           },
           "state": {
-            "type": "string",
-            "description": "Lifecycle phase of the send: `unknown`, `start`, `htlc-received`,\n`payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`."
+            "$ref": "#/components/schemas/LightningSendStateKind",
+            "description": "Lifecycle phase of the send"
           }
         }
+      },
+      "LightningSendStateKind": {
+        "type": "string",
+        "description": "Lifecycle phase of a lightning send.",
+        "enum": [
+          "unknown",
+          "start",
+          "inputs-locked",
+          "htlc-received",
+          "payment-initiated",
+          "revocable-htlcs",
+          "revocation-stuck",
+          "awaiting-reimbursement",
+          "paid",
+          "other"
+        ]
       },
       "MailboxSyncResponse": {
         "type": "object",
@@ -6716,9 +6972,16 @@
       "OffboardResult": {
         "type": "object",
         "required": [
-          "offboard_txid"
+          "offboard_txid",
+          "movement_id"
         ],
         "properties": {
+          "movement_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The movement that records this offboard in the wallet history",
+            "minimum": 0
+          },
           "offboard_txid": {
             "type": "string",
             "description": "The transaction id of the offboard transaction"
@@ -6976,6 +7239,15 @@
           }
         }
       },
+      "PaymentMethodKind": {
+        "type": "string",
+        "description": "A kind of payment method a destination can offer.",
+        "enum": [
+          "ark",
+          "lightning",
+          "onchain"
+        ]
+      },
       "PendingBoardInfo": {
         "type": "object",
         "description": "Describes a completed transition of funds from onchain to offchain.",
@@ -7092,6 +7364,188 @@
           }
         }
       },
+      "PresignedExit": {
+        "type": "object",
+        "description": "The presigned broadcast work for one VTXO.",
+        "required": [
+          "vtxo_id",
+          "status",
+          "unsigned"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/PresignedExitStatus"
+          },
+          "unsigned": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionInfo"
+            },
+            "description": "The remaining tail of this exit's chain that could not be funded, in broadcast order;\nits first transaction spends this exit's last signed one. Empty when fully signed."
+          },
+          "vtxo_id": {
+            "type": "string"
+          }
+        }
+      },
+      "PresignedExitChildInfo": {
+        "type": "object",
+        "description": "A signed CPFP child transaction and the fee it commits.",
+        "required": [
+          "txid",
+          "tx",
+          "fee_info"
+        ],
+        "properties": {
+          "fee_info": {
+            "$ref": "#/components/schemas/FeeInfo",
+            "description": "The exit transaction is zero-fee, so this is the fee of the whole package."
+          },
+          "tx": {
+            "type": "string"
+          },
+          "txid": {
+            "type": "string"
+          }
+        }
+      },
+      "PresignedExitPackage": {
+        "type": "object",
+        "description": "An `(exit, child)` transaction package, to be broadcast as one unit.",
+        "required": [
+          "vtxo_id",
+          "exit",
+          "child"
+        ],
+        "properties": {
+          "child": {
+            "$ref": "#/components/schemas/PresignedExitChildInfo",
+            "description": "The signed CPFP child paying for `exit`."
+          },
+          "exit": {
+            "$ref": "#/components/schemas/TransactionInfo",
+            "description": "The zero-fee exit transaction."
+          },
+          "vtxo_id": {
+            "type": "string",
+            "description": "The VTXO whose exit this package advances."
+          }
+        }
+      },
+      "PresignedExitStatus": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Every package has a signed child; the exit's broadcast completes once wave\n`exited_in_wave` confirms (absent when the chain is already confirmed and there is\nnothing to broadcast). `fee_info` totals the children's fees over the combined weight\nof this exit's packages.",
+            "required": [
+              "fee_info",
+              "type"
+            ],
+            "properties": {
+              "exited_in_wave": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "fee_info": {
+                "$ref": "#/components/schemas/FeeInfo"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "fully-signed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Confirmed funds ran out mid-chain: wave `last_wave` holds this exit's last signed\npackage and `unsigned` continues right after it.",
+            "required": [
+              "last_wave",
+              "type"
+            ],
+            "properties": {
+              "last_wave": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "partially-signed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "No package could be funded.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "unsigned"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How much of a [PresignedExit]'s remaining broadcast work could be funded and signed."
+      },
+      "PresignedExits": {
+        "type": "object",
+        "description": "Presigned emergency-exit chains for a set of VTXOs: a wave-by-wave broadcast plan plus a\nper-VTXO summary.\n\nExecute the plan in wave order: broadcast all of a wave's packages together, then wait for\nevery one, and its `in_mempool` transactions, to confirm before the next wave — each\nwave's children spend change confirmed by the previous wave.",
+        "required": [
+          "exits",
+          "waves"
+        ],
+        "properties": {
+          "exits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresignedExit"
+            },
+            "description": "One entry per requested VTXO, in request order."
+          },
+          "waves": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresignedWave"
+            },
+            "description": "The broadcast plan. Confirmed transactions are omitted, relayed ones are listed in\n`in_mempool`, and a package shared by several exits appears once, under the first exit\nthat references it."
+          }
+        }
+      },
+      "PresignedWave": {
+        "type": "object",
+        "description": "One step of the broadcast plan; see [PresignedExits] for the rules.",
+        "required": [
+          "packages",
+          "in_mempool"
+        ],
+        "properties": {
+          "in_mempool": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionInfo"
+            },
+            "description": "Exit transactions already in the mempool; they confirm with this wave. Only the first\nwave has any."
+          },
+          "packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresignedExitPackage"
+            },
+            "description": "Packages funded independently of each other, broadcast together."
+          }
+        }
+      },
       "RefreshFees": {
         "type": "object",
         "description": "Fees for refresh operations.",
@@ -7127,6 +7581,49 @@
               "type": "string"
             },
             "description": "List of VTXO IDs to refresh. The sum of the VTXOs being refreshed must be\n>= [P2TR_DUST](bitcoin_ext::P2TR_DUST). Keep in mind that fees set out in\n[RefreshFees](crate::cli::fees::RefreshFees) will be deducted from the newly created VTXO, this\nvalue must also be >= [P2TR_DUST](bitcoin_ext::P2TR_DUST)."
+          }
+        }
+      },
+      "RemainingExitTransactions": {
+        "type": "object",
+        "description": "The exit transactions of a set of VTXOs still awaiting confirmation.",
+        "required": [
+          "exits",
+          "transactions"
+        ],
+        "properties": {
+          "exits": {
+            "type": "object",
+            "description": "The transactions each VTXO needs confirmed to be exited, in broadcast order.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "transactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionInfo"
+            },
+            "description": "Every transaction referenced by `exits` exactly once, parents before children."
+          }
+        }
+      },
+      "RemainingExitTransactionsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing the remaining exit transactions.",
+        "properties": {
+          "vtxo_ids": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Comma-separated VTXO ids to inspect. When omitted, every spendable VTXO in the wallet is\nused."
           }
         }
       },
@@ -7335,7 +7832,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The amount to send (in satoshis). Optional for bolt11 invoices. Depending on the\n`destination`, the wallet must contain this amount plus any fees configured by the server in\n[FeeSchedule](crate::cli::fees::FeeSchedule).",
+            "description": "The amount to send (in satoshis). Optional when the destination carries an amount,\nsuch as a BOLT11 invoice or a BIP 321 URI with an amount. Depending on the\n`destination`, the wallet must contain this amount plus any fees configured by the server in\n[FeeSchedule](crate::cli::fees::FeeSchedule).",
             "minimum": 0
           },
           "comment": {
@@ -7347,7 +7844,7 @@
           },
           "destination": {
             "type": "string",
-            "description": "The destination can be an Ark address, a BOLT11-invoice, LNURL or a lightning address"
+            "description": "The destination can be an Ark address, a BOLT11 invoice, a BOLT12 offer, a lightning\naddress, LNURL, a bitcoin address or a BIP 321 URI"
           },
           "max_total_sat": {
             "type": [
@@ -7356,6 +7853,26 @@
             ],
             "format": "int64",
             "description": "Optional maximum debit, including recovery reserves. Supported for Ark addresses only.\nThe send recomputes its cost and rejects an increase above this limit before signing.",
+            "minimum": 0
+          },
+          "method": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PaymentMethodKind",
+                "description": "For a destination with several payment methods, such as a BIP 321 URI,\nthe kind of method to pay with. When empty, the wallet picks Ark, then\nLightning, then on-chain."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retry_for_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "For lightning destinations, how many seconds the Ark server should keep\ntrying to pay, capped to the server's maximum. The server picks its\ndefault when empty.",
             "minimum": 0
           }
         }
@@ -7829,11 +8346,11 @@
           "confirmation": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/BlockRef",
                 "description": "`Some` when the transaction is mined; `None` while still in the mempool."
+              },
+              {
+                "type": "null"
               }
             ]
           },

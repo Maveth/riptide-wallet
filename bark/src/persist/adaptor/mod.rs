@@ -574,6 +574,18 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok((id, true))
 	}
 
+	async fn get_movement_id_by_action(
+		&self,
+		action_id: &str,
+	) -> anyhow::Result<Option<MovementId>> {
+		let guard = self.inner.read().await;
+		let Some(rec) = guard.get(partition::MOVEMENT_ACTION, action_id.as_bytes()).await? else {
+			return Ok(None);
+		};
+		let id = rec.to_data::<u32>().context("corrupt db: movement action index value")?;
+		Ok(Some(MovementId::new(id)))
+	}
+
 	async fn update_movement(&self, movement: &Movement) -> anyhow::Result<()> {
 		let mut guard = self.inner.write().await;
 		write_movement_records(&mut *guard, movement).await
@@ -935,6 +947,22 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			&vtxo_key,
 		)?;
 		self.inner.write().await.put(record).await
+	}
+
+	async fn store_vtxo_keys(&self, keys: &[(u32, PublicKey)]) -> anyhow::Result<()> {
+		// Hold the write lock for the whole batch rather than per key.
+		let mut store = self.inner.write().await;
+		for (index, public_key) in keys {
+			let vtxo_key = SerdeVtxoKey { index: *index, public_key: *public_key };
+			let record = Record::from_data(
+				partition::PUBLIC_KEY,
+				&public_key.serialize()[..],
+				Some(sort::SortKey::u64_desc(*index as u64)),
+				&vtxo_key,
+			)?;
+			store.put(record).await?;
+		}
+		Ok(())
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {

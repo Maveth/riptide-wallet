@@ -15,6 +15,7 @@ use server_rpc::{protos, ServerConnection};
 use crate::{VtxoDelivery, Wallet, WalletVtxo};
 use crate::actions::DriveMode;
 use crate::actions::arkoor_send::{ArkoorSend, start_arkoor_send};
+use crate::movement::MovementId;
 
 /// The result of creating an arkoor transaction
 pub struct ArkoorCreateResult {
@@ -22,24 +23,6 @@ pub struct ArkoorCreateResult {
 	pub inputs: Vec<VtxoId>,
 	pub created: Vec<Vtxo<Full>>,
 	pub change: Vec<Vtxo<Full>>,
-}
-
-/// Error returned by [`Wallet::create_checkpointed_arkoor_with_vtxos`].
-///
-/// The cosign RPC failure is kept as a typed [`tonic::Status`] rather
-/// than flattened into `anyhow`, so a caller driving this as a wallet
-/// action can route a genuine server rejection to its `on_rejection`
-/// path (via `AdvanceError::is_server_rejection`) instead of retrying a
-/// doomed request forever. Every other failure is opaque `Other`.
-#[derive(Debug, thiserror::Error)]
-pub enum ArkoorCreateError {
-	/// The `request_arkoor_cosign` RPC failed. May be a rejection
-	/// (`InvalidArgument`/`NotFound`) or a transient error; the caller
-	/// classifies it via the status code.
-	#[error("server failed to cosign arkoor: {0}")]
-	Cosign(#[source] tonic::Status),
-	#[error(transparent)]
-	Other(#[from] anyhow::Error),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -225,7 +208,7 @@ impl Wallet {
 		change_pieces: Option<Vec<Amount>>,
 		small_anchor_transfer: bool,
 		economical_transfer: bool,
-	) -> Result<ArkoorCreateResult, ArkoorCreateError> {
+	) -> anyhow::Result<ArkoorCreateResult> {
 		let (mut srv, _) = self.require_server().await?;
 		let input_ids = inputs.into_iter().map(|v| v.id()).collect::<Vec<_>>();
 
@@ -281,7 +264,7 @@ impl Wallet {
 		);
 
 		let response = srv.client.request_arkoor_cosign(cosign_request).await
-			.map_err(ArkoorCreateError::Cosign)?
+			.context("error requesting arkoor cosign")?
 			.into_inner();
 
 		let cosign_responses = ArkoorPackageCosignResponse::try_from(response)
@@ -313,27 +296,43 @@ impl Wallet {
 	/// Note that a change [Vtxo] may be created as a result of this call. With each payment these
 	/// will become more uneconomical to unilaterally exit, so you should eventually refresh them
 	/// with [Wallet::refresh_vtxos] or periodically call [Wallet::maintenance_refresh].
+	///
+	/// Returns the id of the movement that records this payment, so the caller
+	/// can attach its own data (notes, contacts) to the right history entry
+	/// without matching on amount and time.
 	pub async fn send_arkoor_payment(
 		&self,
 		destination: &ark::Address,
 		amount: Amount,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<MovementId> {
 		self.send_arkoor_payment_with_max_cost(destination, amount, None).await
 	}
 
 	/// Send with an optional upper bound on the amount plus recovery reserve.
 	pub async fn send_arkoor_payment_with_max_cost(
 		&self, destination: &ark::Address, amount: Amount, max_total: Option<Amount>,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<MovementId> {
 		let action = start_arkoor_send(self, destination.clone(), amount, max_total).await?;
+		let action_id = action.id();
 
-		// Persist the action together with the input locks so the executor has
-		// something to drive on restart; otherwise a crash between this point and
-		// `drive_action` leaves vtxos locked under an action id that has no
-		// checkpoint row.
-		self.inner.db.upsert_wallet_action_checkpoint(&action.id, &action.clone().into()).await?;
+		// Lock the action before its checkpoint exists. Otherwise a wallet sync
+		// can pick up the checkpoint and drive it, and this call would skip
+		// driving and return before the payment is done.
+		let mut checkpoint = self.try_lock_action::<ArkoorSend>(&action_id).await?
+			.context("arkoor send already in progress")?;
 
-		self.drive_action(action, DriveMode::UntilDone).await
+		// Persist the action before driving it, so a crash between this point
+		// and `drive_checkpoint` leaves a checkpoint to resume from. The first
+		// step locks the inputs, so no vtxo is ever locked without a checkpoint
+		// row.
+		checkpoint.create(self, action).await?;
+
+		self.drive_checkpoint(checkpoint, DriveMode::UntilDone).await?;
+
+		// The checkpoint is deleted once the action is done, but the movement
+		// keeps its action index.
+		self.inner.db.get_movement_id_by_action(&action_id).await?
+			.with_context(|| format!("arkoor send {} finished without a movement", action_id))
 	}
 
 	/// Read-only plan shared by estimates and sends. No keys, locks or signatures are created.
@@ -397,7 +396,7 @@ impl Wallet {
 		info!("Syncing {} pending arkoor sends", pending.len());
 		for send in pending {
 			let id = send.id.clone();
-			if let Err(e) = self.drive_action(send, DriveMode::UntilParkOrDone).await {
+			if let Err(e) = self.drive_action::<ArkoorSend>(&id, DriveMode::UntilParkOrDone).await {
 				warn!("Failed to sync arkoor send {}: {:#}", id, e);
 			}
 		}

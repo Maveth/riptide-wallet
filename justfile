@@ -8,3 +8,6 @@ unit filter="":
 
 unit-wallet filter="":
 	cargo test --locked -p bark-wallet --features onchain-bdk --lib {{filter}}
+
+generate-bark-rest-client:
+	bash scripts/generate-rest-client.sh

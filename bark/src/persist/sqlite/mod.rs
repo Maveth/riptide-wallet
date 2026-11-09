@@ -152,6 +152,15 @@ impl BarkPersister for SqliteClient {
 		Ok(result)
 	}
 
+	async fn get_movement_id_by_action(
+		&self,
+		action_id: &str,
+	) -> anyhow::Result<Option<MovementId>> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::get_movement_id_by_action(&tx, action_id)
+	}
+
 	async fn update_movement(&self, movement: &Movement) -> anyhow::Result<()> {
 		let mut conn = self.connect()?;
 		let tx = conn.transaction()?;
@@ -268,6 +277,13 @@ impl BarkPersister for SqliteClient {
 	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()> {
 		let conn = self.connect()?;
 		query::store_vtxo_key(&conn, index, public_key)
+	}
+
+	async fn store_vtxo_keys(&self, keys: &[(u32, PublicKey)]) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction().context("Failed to start transaction")?;
+		query::store_vtxo_keys(&tx, keys)?;
+		tx.commit().context("Failed to commit transaction")
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
@@ -580,7 +596,6 @@ mod test {
 			let changeset = db.initialize_bdk_wallet().await.unwrap();
 			bdk_wallet::Wallet::load()
 				.descriptor(bdk_wallet::KeychainKind::External, Some(desc.clone()))
-				.extract_keys()
 				.check_network(network)
 				.load_wallet_no_persist(changeset)
 				.unwrap()

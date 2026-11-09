@@ -67,6 +67,7 @@ macro_rules! bark_persister_tests {
 			test_vtxo_keys_empty,
 			test_vtxo_key_roundtrip,
 			test_vtxo_key_last_index_advances,
+			test_vtxo_keys_batch,
 
 			test_store_and_get_vtxo,
 			test_get_vtxos_by_state,
@@ -203,8 +204,9 @@ fn send_at_start() -> LightningSend {
 		change_pieces: Some(vec![Amount::from_sat(500), Amount::from_sat(500)]),
 		htlc_key: test_pubkey(),
 		htlc_expiry: BlockHeight::new(100),
-		movement_id: Some(MovementId::new(1)),
+		movement_id: None,
 		revocation_key: Some(test_pubkey()),
+		retry_for: None,
 		progress: Progress::Start,
 		allow_exit_of_htlcs: false,
 	}
@@ -362,6 +364,29 @@ pub async fn test_vtxo_key_last_index_advances(db: &impl BarkPersister) {
 
 	let last = db.get_last_vtxo_key_index().await.expect("get_last_vtxo_key_index");
 	assert_eq!(last, Some(2), "last index after storing indices 0..=2");
+}
+
+pub async fn test_vtxo_keys_batch(db: &impl BarkPersister) {
+	let secp = Secp256k1::new();
+	let keys = (0u32..5).map(|i| {
+		let seed = u8::try_from(i).unwrap() + 20;
+		let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
+		(i, Keypair::from_secret_key(&secp, &sk).public_key())
+	}).collect::<Vec<_>>();
+
+	db.store_vtxo_keys(&keys).await.expect("store_vtxo_keys");
+
+	let last = db.get_last_vtxo_key_index().await.expect("get_last_vtxo_key_index");
+	assert_eq!(last, Some(4), "last index after storing a batch of indices 0..=4");
+	for (i, pk) in &keys {
+		let idx = db.get_public_key_idx(pk).await.expect("get_public_key_idx");
+		assert_eq!(idx, Some(*i), "batch-stored public key maps back to its index");
+	}
+
+	// Storing the same batch again is a no-op.
+	db.store_vtxo_keys(&keys).await.expect("re-storing the same keys");
+	let last = db.get_last_vtxo_key_index().await.expect("get_last_vtxo_key_index");
+	assert_eq!(last, Some(4), "re-storing keys keeps the last index");
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +725,14 @@ pub async fn test_get_or_create_movement_for_action(db: &impl BarkPersister) {
 
 	let movement = db.get_movement_by_id(id).await.expect("get after reuse");
 	assert_eq!(movement.intended_balance, balance, "reuse must not re-apply the update");
+
+	// The action index is what lets a caller find the movement of an action
+	// after its checkpoint is gone.
+	let found = db.get_movement_id_by_action(action_id).await.expect("get by action");
+	assert_eq!(found, Some(id), "lookup by action id");
+	let missing = db.get_movement_id_by_action("no.such.action").await
+		.expect("get by unknown action");
+	assert_eq!(missing, None, "an unknown action must not resolve to a movement");
 }
 
 // ---------------------------------------------------------------------------
@@ -756,25 +789,37 @@ pub async fn test_remove_round_state(db: &impl BarkPersister) {
 // Lightning
 // ---------------------------------------------------------------------------
 
-/// A checkpoint persisted before `movement_id`/`revocation_key`/
-/// `change_pieces` existed has no such fields; `#[serde(default)]` must
-/// load them as `None` not fail.
+/// A checkpoint persisted before `change_pieces` existed has no such field;
+/// `#[serde(default)]` must load it as `None` not fail.
 #[test]
-fn legacy_checkpoint_missing_optional_fields_default_to_none() {
+fn legacy_checkpoint_missing_change_pieces_defaults_to_none() {
 	let checkpoint = WalletActionCheckpoint::from(send_at_start());
 	let mut json = serde_json::to_value(&checkpoint).expect("serialize checkpoint");
-	// Drop the fields to mimic a checkpoint written before they were added.
+	// Drop the field to mimic a checkpoint written before it was added.
 	let obj = json["LightningSend"].as_object_mut().expect("LightningSend object");
-	assert!(obj.remove("movement_id").is_some(), "fixture should carry a movement_id");
-	assert!(obj.remove("revocation_key").is_some(), "fixture should carry a revocation_key");
 	assert!(obj.remove("change_pieces").is_some(), "fixture should carry change_pieces");
 
 	let restored: WalletActionCheckpoint =
 		serde_json::from_value(json).expect("deserialize legacy checkpoint");
 	let send = restored.into_lightning_send().unwrap();
-	assert_eq!(send.movement_id, None);
-	assert_eq!(send.revocation_key, None);
 	assert_eq!(send.change_pieces, None);
+}
+
+/// bark 0.7 and earlier stored the send's movement id on the checkpoint.
+/// A send those versions left at `Start` must keep it, or the `Start` step
+/// creates a second movement.
+#[test]
+fn legacy_checkpoint_keeps_movement_id() {
+	let checkpoint = WalletActionCheckpoint::from(send_at_start());
+	let mut json = serde_json::to_value(&checkpoint).expect("serialize checkpoint");
+	let obj = json["LightningSend"].as_object_mut().expect("LightningSend object");
+	assert!(!obj.contains_key("movement_id"), "new checkpoints should not write movement_id");
+	obj.insert("movement_id".into(), serde_json::to_value(MovementId::new(7)).unwrap());
+
+	let restored: WalletActionCheckpoint =
+		serde_json::from_value(json).expect("deserialize legacy checkpoint");
+	let send = restored.into_lightning_send().unwrap();
+	assert_eq!(send.movement_id, Some(MovementId::new(7)));
 }
 
 pub async fn test_wallet_action_checkpoint_upsert_and_get(db: &impl BarkPersister) {

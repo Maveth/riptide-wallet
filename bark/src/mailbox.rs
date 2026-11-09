@@ -30,23 +30,11 @@ use server_rpc::protos::mailbox_server::MailboxMessage;
 
 use crate::{Wallet, WalletInner, SUBSCRIBE_REQUEST_TIMEOUT};
 use crate::actions::DriveMode;
-use crate::actions::lightning::pay::Progress;
+use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend, Progress};
 use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
-
-
-/// The maximum number of times we will call the fetch mailbox endpoint in one go
-///
-/// We can't trust the server to honestly tell us to keep trying more forever.
-/// A malicious server could send us empty messages or invalid messages and
-/// lock up our resources forever. So we limit the number of times we will fetch.
-/// If a user actually has more messages left, he will have to call sync again.
-///
-/// (Note that currently the server sends 100 messages per fetch, so this would
-/// only happen for users with more than 1000 pending items.)
-pub(crate) const MAX_MAILBOX_REQUEST_BURST: usize = 10;
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -78,6 +66,12 @@ const MAILBOX_PROCESSING_LOCK_KEY: &str = "mailbox.processing";
 /// waiters acquire the lock and dedup as usual.
 const MAILBOX_PROCESSING_LOCK_TIMEOUT: std::time::Duration =
 	std::time::Duration::from_secs(30);
+
+/// How long the handler of a lightning send notification waits for a drive
+/// of the send to release the lock of the send. Other mailbox messages wait
+/// meanwhile, so keep it short.
+const LIGHTNING_SEND_LOCK_TIMEOUT: std::time::Duration =
+	std::time::Duration::from_secs(10);
 
 /// Whether a structurally-valid arkoor vtxo is safe to store as a spendable
 /// received payment.
@@ -314,7 +308,7 @@ impl Wallet {
 		let auth = self.mailbox_authorization(expiry);
 		let mailbox_id = auth.mailbox();
 
-		for _ in 0..MAX_MAILBOX_REQUEST_BURST {
+		loop {
 			let checkpoint = self.get_mailbox_checkpoint().await?;
 			let mailbox_req = protos::mailbox_server::MailboxRequest {
 				mailbox_id: mailbox_id.serialize(),
@@ -462,7 +456,7 @@ impl Wallet {
 				true
 			}
 			Some(Message::LightningSendFinished(msg)) => {
-				if let Err(e) = self.handle_lightning_send_finished(msg, mailbox_msg.checkpoint).await {
+				if let Err(e) = self.handle_lightning_send_finished(msg).await {
 					error!("Error handling lightning send finished notification: {:#}", e);
 				}
 				true
@@ -640,7 +634,6 @@ impl Wallet {
 	async fn handle_lightning_send_finished(
 		&self,
 		notif: protos::mailbox_server::LightningSendFinishedMessage,
-		checkpoint: u64,
 	) -> anyhow::Result<()> {
 		let payment_hash = PaymentHash::try_from(notif.payment_hash)
 			.context("invalid payment hash in lightning send finished notification")?;
@@ -654,49 +647,65 @@ impl Wallet {
 			debug!("Lightning send finished notification (failed): payment_hash={}", payment_hash);
 		}
 
+		// Take the lock that every driver of the send takes, so that no drive
+		// holds a copy of a checkpoint we remove here. A drive that holds the
+		// lock now has often polled the server just before the payment
+		// finished and is about to park, so wait for it. If it keeps the lock
+		// longer, the periodic sync of the daemon drives the send later.
+		//
 		// Errors are logged but not propagated: we always advance the
 		// mailbox checkpoint to avoid re-processing the same
 		// notification on the next poll.
-		match self.is_invoice_paid(payment_hash).await {
-			Ok(true) => {
-				debug!("Lightning send {} already settled; ignoring notification", payment_hash);
-			},
-			Ok(false) => {
-				let lookup = self.lightning_send_checkpoint(payment_hash).await;
-				match lookup {
-					Ok(Some(send)) => {
-						let result = match (&send.progress, known_preimage) {
-							(Progress::PaymentInitiated(htlcs), Some(preimage)) => {
-								let htlcs = htlcs.clone();
-								self.settle_lightning_send_with_preimage(send, htlcs, preimage).await
-							},
-							(Progress::PaymentInitiated(_), None) => {
-								self.drive_action(send, DriveMode::UntilParkOrDone).await
-							},
-							_ => {
-								debug!("Lightning send finished notification for {} but checkpoint is not PaymentInitiated; ignoring", payment_hash);
-								Ok(())
-							},
-						};
-						match result {
-							Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
-							Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
-						}
-					},
-					Ok(None) => {
-						warn!("Lightning send finished notification for unknown payment hash {}", payment_hash);
-					},
-					Err(e) => {
-						error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e);
-					},
-				}
-			},
+		let action_id = ln_pay_action_id(payment_hash);
+		let checkpoint = match self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await {
+			Ok(checkpoint) => checkpoint,
 			Err(e) => {
-				error!("Failed to look up paid_invoice for {}: {:#}", payment_hash, e);
+				info!("Could not read lightning send {} under its lock, leaving it to the next sync: {:#}", payment_hash, e);
+				return Ok(());
 			},
+		};
+
+		let (progress, paid) = match (
+			checkpoint.get().map(|send| send.progress.clone()),
+			self.is_invoice_paid(payment_hash).await,
+		) {
+			(Some(progress), Ok(paid)) => (progress, paid),
+			(None, Ok(true)) => {
+				debug!("Lightning send {} already settled; ignoring notification", payment_hash);
+				return Ok(());
+			},
+			(None, Ok(false)) => {
+				warn!("Lightning send finished notification for unknown payment hash {}", payment_hash);
+				return Ok(());
+			},
+			(_, Err(e)) => {
+				error!("Failed to look up lightning send {}: {:#}", payment_hash, e);
+				return Ok(());
+			},
+		};
+
+		let result = match (progress, known_preimage) {
+			// A settlement stopped half-way. The drive finishes it from the
+			// stored preimage.
+			_ if paid => {
+				self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await
+			},
+			(Progress::PaymentInitiated(htlcs), Some(preimage)) => {
+				self.settle_lightning_send_with_preimage(checkpoint, htlcs, preimage).await
+			},
+			(Progress::PaymentInitiated(_), None) => {
+				self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await
+			},
+			_ => {
+				debug!("Lightning send finished notification for {} but checkpoint is not PaymentInitiated; ignoring", payment_hash);
+				Ok(())
+			},
+		};
+		match result {
+			Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
+			Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
 		}
 
-		self.store_mailbox_checkpoint(checkpoint).await?;
 		Ok(())
 	}
 

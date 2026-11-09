@@ -17,6 +17,14 @@ payments can be below the funded-HTLC minimum. The server can change these limit
 experimental and provided without warranty. Functional tests are not a security
 audit. Bugs can cause loss of funds. Use only amounts you can afford to lose.
 
+## 0.10.0 source update
+
+The next release integrates upstream Bark 0.8.1. It fixes Lightning sends that
+remain pending after payment, rejects expired WebSocket tickets, and improves
+payment-URI parsing and invoice-expiry controls. Existing Paperclip setup,
+sign-in, transaction-result screens, and XBT recovery support are retained.
+See [upgrade and compatibility notes](docs/upgrade-0.10.0.md).
+
 ## 0.9.3
 
 Fixes blockchain RPC connections that could remain stuck after a canceled request or a closed server connection, leaving Ark balances unavailable. Connections can recover without restarting the wallet. Existing keys, authentication, settings, fees, recovery data, and older-client compatibility are unchanged. Interrupted payments are not automatically retried. Back up the complete wallet before updating.

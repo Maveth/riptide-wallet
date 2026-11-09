@@ -8,6 +8,8 @@ pub mod config;
 pub mod error;
 #[cfg(feature = "web-ui")]
 pub mod web;
+#[cfg(feature = "swagger-ui")]
+mod swagger;
 
 mod notifications;
 
@@ -201,7 +203,7 @@ pub struct ServerState {
 	/// wipe then removes.
 	wallet_lifecycle: tokio::sync::Mutex<()>,
 
-	/// A map of websocket tickets to their expiration time
+	/// A map of websocket tickets to their creation time
 	///
 	/// Note: this map is only stored in memory and not persisted
 	/// to the database, any server restart will clear the map.
@@ -361,10 +363,7 @@ impl RestServer {
 		#[cfg(feature = "swagger-ui")]
 		let router = {
 			log::info!("Swagger UI is hosted on http://{}/swagger-ui", socket_addr);
-			router.merge(
-				utoipa_swagger_ui::SwaggerUi::new("/swagger-ui")
-					.url("/api-docs/openapi.json", _api.clone()),
-			)
+			router.merge(swagger::router(_api.clone()))
 		};
 
 		#[cfg(feature = "web-ui")]

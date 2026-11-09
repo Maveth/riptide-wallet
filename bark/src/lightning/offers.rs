@@ -102,7 +102,7 @@ impl Wallet {
 			let receive = LightningReceive {
 				invoice: Invoice::Bolt12(invoice), payment_hash: hash, payment_preimage: preimage,
 				htlc_recv_cltv_delta: delta, anti_dos_token: None, claim_destination: None,
-				key_index, progress: Progress::AwaitingPayment,
+				key_index, progress: Progress::AwaitingPayment, claim_attempts: 0,
 			};
 			// Durable before either registration or publication. A timeout or restart
 			// reuses this exact invoice and preimage, never an untracked payment.

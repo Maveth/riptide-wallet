@@ -419,8 +419,10 @@ pub use self::config::{
 };
 pub use self::daemon::{tip_watcher, DaemonHandle};
 pub use self::fees::FeeEstimate;
+pub use self::lightning::{Bolt11InvoiceBuilder, LightningSendOptions};
 pub use self::import::{ImportVtxoArgs, ImportVtxoError};
 pub use self::notification::{WalletNotification, NotificationStream};
+pub use self::offboard::OffboardResult;
 pub use self::recovery::{RecoveryReport, RecoveryReportEntry, RecoveryStatus};
 pub use self::vtxo::WalletVtxo;
 
@@ -432,7 +434,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use bip39::Mnemonic;
-use bitcoin::{Amount, Network, OutPoint};
+use bitcoin::{Amount, FeeRate, Network, OutPoint};
 use bitcoin::bip32::{self, ChildNumber, Fingerprint};
 use bitcoin::secp256k1::{self, Keypair, PublicKey};
 use futures::stream::FuturesUnordered;
@@ -448,12 +450,12 @@ use ark::rounds::{RoundAttempt, RoundEvent};
 use ark::vtxo::{Full, PubkeyVtxoPolicy, VtxoRef, VTXO_DUST};
 use ark::vtxo::policy::signing::VtxoSigner;
 use bitcoin_ext::{BlockDelta, BlockHeight, TxStatus};
-use server_rpc::{protos, ServerConnection};
+use server_rpc::{protos, ServerConnection, MAX_NB_REGISTER_VTXOS, MAX_NB_VTXO_IDS};
 use server_rpc::protos::VtxoSpendState;
 use server_rpc::client::{ConnectError, CreateEndpointError};
 
 use crate::chain::{ChainSource, ChainSourceSpec};
-use crate::exit::Exit;
+use crate::exit::{Exit, ExitError, PresignedExits, RemainingExitTransactions};
 use crate::lock_manager::LockManager;
 use crate::movement::{Movement, MovementId, PaymentMethod};
 use crate::movement::manager::MovementManager;
@@ -520,6 +522,10 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 	ensure!(ark_info.nb_round_nonces > 0,
 		"server-advertised nb_round_nonces is 0; refusing to connect",
 	);
+	ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
+		"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
+		ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
+	);
 	if ark_info.network == Network::Bitcoin {
 		// No upper bound: a long lifetime is safe because unilateral exit is
 		// always available before the server-only timeout leaf activates.
@@ -532,10 +538,6 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 			"server-advertised vtxo_exit_delta {} is below the mainnet minimum of {} \
 			 blocks; refusing to connect",
 			ark_info.vtxo_exit_delta, MIN_MAINNET_VTXO_EXIT_DELTA,
-		);
-		ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
-			"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
-			ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
 		);
 	}
 	Ok(())
@@ -1077,10 +1079,9 @@ impl Wallet {
 			if unrevealed.remove(&pubkey) {
 				// Reveal this key and the unmatched keys below it, because the
 				// wallet issues keys in sequence.
-				for (i, pk) in gap.drain(..) {
-					self.inner.db.store_vtxo_key(i, pk).await?;
-				}
-				self.inner.db.store_vtxo_key(idx, pubkey).await?;
+				gap.push((idx, pubkey));
+				self.inner.db.store_vtxo_keys(&gap).await?;
+				gap.clear();
 				found.insert(pubkey, keypair);
 
 				// `frontier` is the last index the scan tests. This index matched,
@@ -1396,14 +1397,15 @@ impl Wallet {
 			info!("Seed-based wallet recovery explicitly skipped");
 			RecoveryStatus::NotRun
 		} else {
-			// Recover any VTXOs backed up to the seed-derived recovery mailbox.
-			// Best-effort so it can't abort wallet creation, but a failure means
-			// funds may be missing — surface it loudly. Partial failures are
-			// logged inside the recovery call.
-			match ret.recover_from_mailbox().await {
+			// Recover any VTXOs the server knows for our keys or that were
+			// backed up to the seed-derived recovery mailbox. Best-effort so it
+			// can't abort wallet creation, but a failure means funds may be
+			// missing — surface it loudly. Partial failures are logged inside
+			// the recovery call.
+			match ret.recover_from_seed().await {
 				Ok(report) => RecoveryStatus::Completed(report),
 				Err(e) => {
-					error!("VTXO recovery from the recovery mailbox failed; funds may be \
+					error!("VTXO recovery from seed failed; funds may be \
 						missing from this wallet until recovery succeeds: {:#}", e);
 					RecoveryStatus::Failed(e)
 				},
@@ -1421,6 +1423,42 @@ impl Wallet {
 		}
 
 		Ok(ret)
+	}
+
+	/// Builds a wallet on an in-memory database, with a chain source and an
+	/// Ark server that cannot be reached, for tests of paths that must not
+	/// reach either: a call that does reach them fails. The connection is
+	/// returned because dropping it drops the database.
+	#[cfg(all(test, feature = "sqlite"))]
+	pub(crate) async fn offline_for_test() -> (Wallet, rusqlite::Connection) {
+		let network = Network::Regtest;
+		let seed = WalletSeed::new_from_seed(network, &[1; 64]);
+		let mut config = Config::network_default(network);
+		config.server_address = "http://127.0.0.1:1".to_owned();
+
+		let (path, conn) = crate::persist::sqlite::helpers::in_memory_db();
+		let db: Arc<dyn BarkPersister> = Arc::new(crate::persist::sqlite::SqliteClient::open(path).unwrap());
+		db.init_wallet(&WalletProperties {
+			network,
+			fingerprint: seed.fingerprint(),
+			server_pubkey: None,
+			server_mailbox_pubkey: None,
+		}).await.unwrap();
+
+		let chain = Arc::new(ChainSource::offline_for_test(network));
+		let notifications = NotificationDispatch::new();
+		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
+		let exit = Exit::new(db.clone(), chain.clone(), movements.clone()).await.unwrap();
+		let wallet = Wallet { inner: Arc::new(WalletInner {
+			config, db, seed, exit, movements, notifications, chain,
+			lock_manager: Box::new(crate::lock_manager::memory::MemoryLockManager::new()),
+			server: tokio::sync::OnceCell::new(),
+			onchain: None,
+			daemon: parking_lot::Mutex::new(None),
+			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+			round_secret_nonces: RoundSecretNonces::new(),
+		})};
+		(wallet, conn)
 	}
 
 	/// Returns the config used to create/load the bark [Wallet].
@@ -1619,6 +1657,67 @@ impl Wallet {
 			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may \
 			need updating", resp.spend_state,
 		))
+	}
+
+	/// Ask the server for the spend state of every VTXO in `queries`, in
+	/// batches of [`MAX_NB_VTXO_IDS`].
+	///
+	/// Each keypair must be its VTXO's private key so we can prove ownership.
+	///
+	/// A VTXO the server does not know, whose batch request failed, or whose
+	/// answer is unusable, is absent from the result. Only a server that cannot
+	/// be reached is an error.
+	pub(crate) async fn fetch_vtxo_spend_states(
+		&self,
+		queries: &[(VtxoId, &Keypair)],
+	) -> anyhow::Result<HashMap<VtxoId, VtxoSpendState>> {
+		let mut ret = HashMap::with_capacity(queries.len());
+		if queries.is_empty() {
+			return Ok(ret);
+		}
+
+		let (mut srv, _) = self.require_server().await?;
+		for chunk in queries.chunks(MAX_NB_VTXO_IDS) {
+			let req = protos::GetVtxosStatusByIdsRequest {
+				vtxos: chunk.iter().map(|(id, keypair)| protos::VtxoStatusQuery {
+					vtxo_id: id.to_bytes().to_vec(),
+					attestation: VtxoStatusAttestation::new(*id, keypair).serialize(),
+				}).collect(),
+			};
+			let resp = match srv.client.get_vtxos_status_by_ids(req).await {
+				Ok(resp) => resp.into_inner(),
+				Err(e) => {
+					warn!("Could not fetch the status of {} vtxos from server: {:#}", chunk.len(), e);
+					continue;
+				},
+			};
+
+			// The caller decides what an unanswered id means and logs it.
+			for raw in &resp.missing_vtxo_ids {
+				match VtxoId::from_slice(raw) {
+					Ok(id) => debug!("Server does not know vtxo {id}, no status returned"),
+					Err(_) => debug!("Server reported an undecodable missing vtxo id: {raw:?}"),
+				}
+			}
+
+			for status in &resp.vtxos {
+				let Ok(id) = VtxoId::from_slice(&status.vtxo_id) else {
+					warn!("Server returned a status for an undecodable vtxo id: {:?}", status.vtxo_id);
+					continue;
+				};
+				match VtxoSpendState::try_from(status.spend_state) {
+					Ok(state) => {
+						ret.insert(id, state);
+					},
+					Err(_) => warn!(
+						"server returned unknown spend state {} for vtxo {id}; this wallet may \
+						need updating", status.spend_state,
+					),
+				}
+			}
+		}
+
+		Ok(ret)
 	}
 
 	/// Retrieves the full state of a [Vtxo] for a given [VtxoId] if it exists in the database.
@@ -2037,6 +2136,28 @@ impl Wallet {
 	pub async fn progress_exits(&self) -> anyhow::Result<()> {
 		self.exit_mgr().progress_exits_with_cpfp(&self, None).await?;
 		Ok(())
+	}
+
+	/// Presign the CPFP children needed to unilaterally (emergency) exit the given VTXOs.
+	///
+	/// Thin wrapper over [Exit::presign_emergency_exit]; see it and [PresignedExits] for the
+	/// broadcast rules and the wallet state this touches.
+	pub async fn presign_emergency_exit(
+		&self,
+		vtxos: &[VtxoId],
+		fee_rate: Option<FeeRate>,
+	) -> anyhow::Result<PresignedExits, ExitError> {
+		self.exit_mgr().presign_emergency_exit(vtxos, self, fee_rate).await
+	}
+
+	/// List the exit transactions still awaiting confirmation for the given VTXOs.
+	///
+	/// Thin wrapper over [Exit::remaining_exit_transactions]; see it for the semantics.
+	pub async fn remaining_exit_transactions(
+		&self,
+		vtxos: &[VtxoId],
+	) -> anyhow::Result<RemainingExitTransactions, ExitError> {
+		self.exit_mgr().remaining_exit_transactions(vtxos).await
 	}
 
 	/// Detect spendable VTXOs that were exited on-chain without the user asking for it — e.g.
@@ -2515,20 +2636,23 @@ impl Wallet {
 	}
 
 	/// Registers the signed transaction chains for the given VTXOs with the
-	/// server. This must be called before spending VTXOs so the server can
-	/// publish forfeits if needed.
-	pub async fn register_vtxo_transactions_with_server(
+	/// server, in batches of [`MAX_NB_REGISTER_VTXOS`]. This must be called
+	/// before spending VTXOs so the server can publish forfeits if needed.
+	pub async fn register_vtxo_transactions_with_server<V: AsRef<Vtxo<Full>>>(
 		&self,
-		vtxos: &[impl AsRef<Vtxo<Full>>],
+		vtxos: impl IntoIterator<Item = V>,
 	) -> anyhow::Result<()> {
+		let vtxos = vtxos.into_iter().map(|v| v.as_ref().serialize()).collect::<Vec<_>>();
 		if vtxos.is_empty() {
 			return Ok(());
 		}
 
 		let (mut srv, _) = self.require_server().await?;
-		srv.client.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
-			vtxos: vtxos.iter().map(|v| v.as_ref().serialize()).collect(),
-		}).await.context("failed to register vtxo transactions")?;
+		for chunk in vtxos.chunks(MAX_NB_REGISTER_VTXOS) {
+			srv.client.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
+				vtxos: chunk.to_vec(),
+			}).await.context("failed to register vtxo transactions")?;
+		}
 
 		Ok(())
 	}
@@ -2685,10 +2809,14 @@ mod tests {
 
 	#[test]
 	fn ark_info_over_nb_round_nonces_cap_is_rejected() {
+		// the cap holds on every network, not only on mainnet
 		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+
 		ai.network = Network::Bitcoin;
 		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
-		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
 		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
 		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
 	}

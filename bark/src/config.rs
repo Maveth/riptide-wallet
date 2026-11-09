@@ -110,7 +110,7 @@ pub struct Config {
 	/// Format: `<name>/<version>`. The name must be 1-32 chars of lowercase
 	/// ASCII alphanumeric, `-`, or `_`. Anything else (uppercase, missing
 	/// slash, invalid chars, too long) gets the RPC rejected by the server
-	/// with `invalid_argument`.
+	/// with `invalid_argument`. Versions longer than 32 chars are truncated.
 	pub user_agent: Option<String>,
 
 	/// The address of the Esplora HTTP REST server to use.
@@ -194,7 +194,7 @@ pub struct Config {
 	/// The number of confirmations required before considering a round tx
 	/// fully confirmed
 	///
-	/// Default value: 6 for mainnet, 2 for testnets
+	/// Default value: 1
 	pub round_tx_required_confirmations: BlockDelta,
 
 	/// The number of confirmations required before considering an offboard tx
@@ -213,7 +213,7 @@ pub struct Config {
 	pub offboard_lost_tx_grace_period_secs: u64,
 
 	/// Daemon sync interval in seconds for periodic tasks (onchain, exits,
-	/// boards, offboards, maintenance, rounds, mailbox).
+	/// boards, offboards, lightning sends, maintenance, rounds, mailbox).
 	///
 	/// Default value: 60
 	pub daemon_sync_interval_secs: u64,

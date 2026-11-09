@@ -20,7 +20,9 @@ use bitcoin_ext::{BlockDelta, TxStatus};
 use server_rpc::protos;
 
 use crate::Wallet;
-use crate::actions::{Advance, AdvanceError, WalletAction, WalletActionId};
+use crate::actions::{
+	Advance, AdvanceError, IntoAdvanceResult, WalletAction, WalletActionCheckpoint, WalletActionId,
+};
 use crate::chain::BroadcastError;
 use crate::movement::{MovementId, MovementStatus};
 use crate::movement::update::MovementUpdate;
@@ -122,7 +124,8 @@ pub enum Progress {
 	/// being retried (with the vtxo left Locked) until it succeeds, the board exits,
 	/// or it expires.
 	Confirming {
-		/// Most recent reason a registration attempt failed, for diagnostics.
+		/// Most recent reason the board parked without progress, for
+		/// diagnostics.
 		last_park_error: Option<String>,
 	},
 }
@@ -141,14 +144,21 @@ pub(crate) fn board_action_id(utxo: OutPoint) -> WalletActionId {
 impl WalletAction for Board {
 	fn id(&self) -> WalletActionId { Board::id(self) }
 
+	fn from_checkpoint(checkpoint: WalletActionCheckpoint) -> Option<Self> {
+		checkpoint.into_board()
+	}
+
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
-		match self.progress.clone() {
-			Progress::Broadcasting { signed_vtxo } => {
+		match self.progress {
+			Progress::Broadcasting { ref signed_vtxo } => {
 				match run_broadcast(wallet, &self, signed_vtxo).await? {
-					BroadcastOutcome::Seen => Ok(Advance::Next(Board {
-						progress: Progress::Confirming { last_park_error: None },
-						..self
-					})),
+					BroadcastOutcome::Seen => {
+						record_funding_tx(wallet, &self).await;
+						Ok(Advance::Next(Board {
+							progress: Progress::Confirming { last_park_error: None },
+							..self
+						}))
+					},
 					BroadcastOutcome::Conflicted => fail_dead_board(wallet, &self).await,
 					// Not on the network yet, so there is nothing to confirm.
 					BroadcastOutcome::Waiting =>
@@ -168,27 +178,45 @@ impl WalletAction for Board {
 		}
 	}
 
-	async fn on_rejection(
-		self,
-		_wallet: &Wallet,
-		error: AdvanceError,
-	) -> anyhow::Result<Advance<Self>> {
-		// The funding tx is already on-chain by the time the action runs, so we
-		// can never safely fail-and-release. Registration failures are handled
-		// inline in `Confirming` (kept retrying, vtxo left Locked), so a
-		// rejection reaching here is unexpected; re-evaluate from `Confirming`
-		// rather than tearing the board down.
-		warn!("board {} hit an unexpected rejection, re-evaluating: {:#}", self.id, error);
-		// Keep `Broadcasting` so its `signed_vtxo` survives for the next drive.
+	/// The funding tx may already be on-chain by the time the action
+	/// runs, so we can never safely fail-and-release. Registration
+	/// failures are handled inline in `Confirming` (kept retrying, vtxo
+	/// left Locked), so the only abort that reaches here is a checkpoint
+	/// without a funding transaction, which no re-drive can heal. Park
+	/// with the reason, so the caller hears it and the checkpoint shows
+	/// why the board is stuck. Keep `Broadcasting` so its `signed_vtxo`
+	/// survives for the next drive.
+	async fn on_abort(self, _wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
 		let progress = match self.progress {
 			broadcasting @ Progress::Broadcasting { .. } => broadcasting,
-			Progress::Confirming { .. } => Progress::Confirming { last_park_error: None },
+			Progress::Confirming { .. } => Progress::Confirming {
+				last_park_error: Some(format!("{:#}", error)),
+			},
 		};
-		Ok(Advance::Park {
+		Advance::Park {
 			state: Board { progress, ..self },
 			wake_after: None,
-			error: None,
-		})
+			error: Some(error),
+		}
+	}
+}
+
+/// Store the funding tx in the onchain wallet now that it is on the network,
+/// like `OnchainWallet::drain` does for its own spends: a sync can lag the
+/// mempool, and until one sees the spend the wallet would hand the funding
+/// inputs to the next transaction.
+async fn record_funding_tx(wallet: &Wallet, board: &Board) {
+	let Some(onchain) = wallet.inner.onchain.as_ref() else { return };
+	match board.to_broadcast() {
+		Ok(Some(tx)) => {
+			if let Err(e) = onchain.write().await.register_tx(&tx).await {
+				warn!("Failed to record board {} funding tx in the onchain wallet: {:#}",
+					board.id, e,
+				);
+			}
+		},
+		Ok(None) => {},
+		Err(e) => warn!("Board {} has no funding tx to record: {:#}", board.id, e),
 	}
 }
 
@@ -208,24 +236,27 @@ enum BroadcastOutcome {
 async fn run_broadcast(
 	wallet: &Wallet,
 	board: &Board,
-	signed_vtxo: Vtxo<Full>,
+	signed_vtxo: &Vtxo<Full>,
 ) -> Result<BroadcastOutcome, AdvanceError> {
 	// The server doesn't know this vtxo until `register_board`, so skip the
 	// recovery-mailbox post `store_locked_vtxos` would do (it would fail the
 	// mailbox FK to `vtxo`); `register_board` posts it once accepted.
 	wallet.store_vtxos(
-		[&signed_vtxo],
+		[signed_vtxo],
 		&VtxoState::Locked {
 			holder: Some(crate::vtxo::VtxoLockHolder::Movement { id: board.movement_id }),
 		},
-	).await?;
+	).await.retry()?;
+
+	// A checkpoint without a funding transaction can't be fixed by trying again.
+	let funding_txid = board.funding_txid().abort()?;
 
 	// Leave on a positive "already on-chain" signal only. A not-yet-broadcast
 	// funding tx is unknown to the chain source, and some backends report that by
 	// erroring rather than returning `NotFound`, so treat anything but a
 	// confirmed/mempool hit as "still needs broadcasting".
 	if matches!(
-		wallet.inner.chain.tx_status(board.funding_txid()?).await,
+		wallet.inner.chain.tx_status(funding_txid).await,
 		Ok(TxStatus::Mempool) | Ok(TxStatus::Confirmed(_)),
 	) {
 		return Ok(BroadcastOutcome::Seen);
@@ -239,7 +270,7 @@ async fn run_broadcast(
 		// A confirmed funding tx spends its own inputs, which reads as a conflict, and
 		// the probe above cannot rule that out when the chain source errors. Write the
 		// board off on a positive "absent" answer only.
-		FundingConflict::Fatal => match wallet.inner.chain.tx_status(board.funding_txid()?).await {
+		FundingConflict::Fatal => match wallet.inner.chain.tx_status(funding_txid).await {
 			Ok(TxStatus::Mempool) | Ok(TxStatus::Confirmed(_)) => Ok(BroadcastOutcome::Seen),
 			Ok(TxStatus::NotFound) => Ok(BroadcastOutcome::Conflicted),
 			Err(_) => Ok(BroadcastOutcome::Waiting),
@@ -262,17 +293,17 @@ async fn run_broadcast(
 /// sufficiently confirmed, and kick off an exit near expiry (keeping the board
 /// around so registration can still win while the exit is abortable).
 async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, AdvanceError> {
-	let (_, ark_info) = wallet.require_server().await?;
-	let current_height = wallet.inner.chain.tip().await?;
+	let (_, ark_info) = wallet.require_server().await.retry()?;
+	let current_height = wallet.inner.chain.tip().await.retry()?;
 	let required = BlockDelta::new(ark_info.required_board_confirmations as u16);
 
-	let vtxo = wallet.get_vtxo_by_id(board.vtxo_id).await?;
+	let vtxo = wallet.get_vtxo_by_id(board.vtxo_id).await.retry()?;
 
 	// If an exit has progressed beyond the abortable stage, server-side
 	// registration can no longer succeed: finish the movement and stop.
 	if vtxo.state.kind() == VtxoStateKind::Exited {
 		wallet.inner.movements.finish_movement(board.movement_id, MovementStatus::Failed).await
-			.context("failed to finalize exited board movement")?;
+			.context("failed to finalize exited board movement").retry()?;
 		return Ok(Advance::Done);
 	}
 
@@ -283,7 +314,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 		wallet.inner.movements.finish_movement_with_update(
 			board.movement_id, MovementStatus::Failed,
 			MovementUpdate::new().effective_balance(SignedAmount::ZERO),
-		).await.context("failed to finalize double-spent board movement")?;
+		).await.context("failed to finalize double-spent board movement").retry()?;
 		return Ok(Advance::Done);
 	}
 
@@ -348,13 +379,13 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	if vtxo.expiry_height() <= current_height + exit_margin {
 		if !wallet.exit_mgr().is_exiting(vtxo.id()).await {
 			warn!("Board {} expired before confirmation, marking VTXO for exit", board.id);
-			wallet.inner.exit.start_exit_for_vtxos(&[vtxo.vtxo.clone()]).await?;
+			wallet.inner.exit.start_exit_for_vtxos(&[vtxo.vtxo.clone()]).await.retry()?;
 		}
 		// Record unconditionally (idempotent): a crash after `start_exit_for_vtxos`
 		// would otherwise leave `is_exiting` true and never record the exit.
 		wallet.inner.movements.update_movement(
 			board.movement_id, MovementUpdate::new().exited_vtxo(board.vtxo_id),
-		).await.context("failed to record board exit on movement")?;
+		).await.context("failed to record board exit on movement").retry()?;
 	}
 
 	Ok(Advance::Park {
@@ -431,8 +462,11 @@ enum FundingConflict {
 /// transient node error) leaves the outcome open, so we park. A chain source
 /// error on either probe is likewise left open rather than propagated: it says
 /// nothing about the funding tx itself.
-async fn funding_conflict(wallet: &Wallet, board: &Board) -> anyhow::Result<FundingConflict> {
-	for input in &board.funding()?.input {
+async fn funding_conflict(
+	wallet: &Wallet,
+	board: &Board,
+) -> Result<FundingConflict, AdvanceError> {
+	for input in &board.funding().abort()?.input {
 		let parent = input.previous_output.txid;
 		match wallet.inner.chain.tx_status(parent).await {
 			// The caller only reaches here while the funding tx itself is absent
@@ -458,7 +492,7 @@ async fn funding_conflict(wallet: &Wallet, board: &Board) -> anyhow::Result<Fund
 		}
 	}
 
-	let Some(tx) = board.to_broadcast()? else {
+	let Some(tx) = board.to_broadcast().abort()? else {
 		// Without the signatures there is nothing to probe with: a transaction we
 		// cannot complete would be rejected on its own merits and tell us nothing
 		// about its inputs. No input is spent by a confirmed tx, so the outcome is
@@ -627,6 +661,10 @@ mod test {
 /// Fail a board whose funding tx can never confirm: mark its vtxo spent and close
 /// the movement out at zero. Reached from either phase, since a funding input can
 /// be spent before the transaction is ever seen as well as after.
+///
+/// Re-entrant: a re-drive after a crash between the two writes finds the vtxo
+/// already spent, which is accepted as an old state so the movement still gets
+/// closed.
 async fn fail_dead_board(
 	wallet: &Wallet,
 	board: &Board,
@@ -634,11 +672,11 @@ async fn fail_dead_board(
 	warn!("Board {} funding input was spent by a confirmed conflicting tx, \
 		failing the board", board.id);
 	wallet.inner.db.update_vtxo_state_checked(
-		board.vtxo_id, VtxoState::Spent, &[VtxoStateKind::Locked],
-	).await.context("failed to mark double-spent board vtxo as spent")?;
+		board.vtxo_id, VtxoState::Spent, &[VtxoStateKind::Locked, VtxoStateKind::Spent],
+	).await.context("failed to mark double-spent board vtxo as spent").retry()?;
 	wallet.inner.movements.finish_movement_with_update(
 		board.movement_id, MovementStatus::Failed,
 		MovementUpdate::new().effective_balance(SignedAmount::ZERO),
-	).await.context("failed to finalize double-spent board movement")?;
+	).await.context("failed to finalize double-spent board movement").retry()?;
 	Ok(Advance::Done)
 }
