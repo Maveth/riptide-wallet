@@ -12,7 +12,7 @@ async function api(path, body, method, signal) {
   const abort = () => controller.abort();
   if (signal?.aborted) abort();
   signal?.addEventListener('abort', abort, {once: true});
-  const timer = setTimeout(abort, body === undefined ? 10000 : 60000);
+  const timer = setTimeout(abort, body === undefined ? 10000 : (String(path).includes('lightning/pay') ? 180000 : 60000));
   try {
   const response = await fetch(path.startsWith('/') ? path : '/api/v1/' + path, {
     signal: controller.signal, method: method || (body === undefined ? 'GET' : 'POST'), cache: 'no-store', redirect: 'error',
@@ -57,6 +57,8 @@ async function updateBalances(sessionToken) {
   if ($('ln-tab-balance')) $('ln-tab-balance').textContent = Number.isSafeInteger(tab?.balance_sat) ? tab.balance_sat.toLocaleString() : '—';
   if ($('ln-tab-return')) $('ln-tab-return').disabled = !(Number.isSafeInteger(tab?.balance_sat) && tab.balance_sat >= 1000);
   if ($('ln-tab-opt') && tab) $('ln-tab-opt').checked = tab.opted_out === true;
+  const named = await api('lightning/address').catch(() => null);
+  if ($('ln-address')) $('ln-address').textContent = named?.address || '';
   syncTabCard();
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
@@ -298,10 +300,11 @@ async function reviewPay(title, body, choices) {
   }
   $('review-title').textContent = title;
   $('review-body').textContent = body;
-  $('review-confirm').hidden = !choices.coin;
-  $('review-confirm').textContent = 'Pay from my coin';
-  $('review-confirm').value = 'coin';
-  $('review-tab').hidden = !choices.tab;
+  const only = choices.tab && !choices.coin ? 'tab' : (choices.coin && !choices.tab ? 'coin' : null);
+  $('review-confirm').hidden = only === null && !choices.coin;
+  $('review-confirm').textContent = only ? 'Pay' : 'Pay from my coin';
+  $('review-confirm').value = only || 'coin';
+  $('review-tab').hidden = only !== null || !choices.tab;
   $('review-topup').hidden = !choices.topup;
   dialog.returnValue = '';
   dialog.showModal();
@@ -362,11 +365,11 @@ $('ln-pay').onsubmit = event => { event.preventDefault(); run(event.submitter, a
     if (!tabAffordable) costs += '\n\nThe tab has ' + tabBalance.toLocaleString() + ' sats. Top up 1,000 once, then review this payment again.';
   }
   const picked = await reviewPay('Lightning payment', 'Pay ' + (amount === null ? 'the invoice amount' : amount.toLocaleString() + ' sats') + ' on ' + network + '?\n' + destination + '\n\n' + costs, {
-    coin: !fromTab, tab: tabAffordable, topup: true
+    coin: !fromTab, tab: tabAffordable, topup: false
   });
-  if (picked === 'topup') { await topUpOnce(); return; }
   if (picked !== 'coin' && picked !== 'tab') return;
   fromTab = picked === 'tab';
+  status('Sending the payment.');
   const result = await mutate('lightning/pay', {destination, amount_sat: amount, comment: null, source: picked});
   $('ln-result').textContent = JSON.stringify(result, null, 2);
   paymentSummary('Submitted', 'Payment submitted once. Check Sent status before trying again.');
@@ -393,6 +396,14 @@ function syncTabCard() {
   if (!card || !$('ln-tab-opt')) return;
   card.classList.toggle('opted-out', $('ln-tab-opt').checked === true);
 }
+if ($('ln-address-claim')) $('ln-address-claim').onclick = () => { run($('ln-address-claim'), async () => {
+  const name = ($('ln-address-name').value || '').trim().toLowerCase();
+  if (!name) throw new Error('Type a name first.');
+  if (!await reviewConfirm('Claim Lightning address', 'Claim ' + name + '@ark-riptide.maveth.ca?\n\nThe first person to claim a name keeps it. Payments under 1,000 sats credit the tab even if this wallet is closed. 1,000 sats or more become a coin, so this wallet has to be open.')) return;
+  const result = await mutate('lightning/address', { name });
+  if ($('ln-address')) $('ln-address').textContent = result.address || '';
+  status('Lightning address: ' + (result.address || name));
+}); };
 $('ln-tab-opt').onchange = event => run(event.target, async () => {
   const optedOut = event.target.checked === true;
   syncTabCard();

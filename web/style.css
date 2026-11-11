@@ -57,3 +57,5 @@ body{background:radial-gradient(ellipse at 85% 0%,#f568350a,transparent 48%),#11
 .tab-note summary{cursor:pointer;color:#8b9bb8}
 .tab-card.opted-out #ln-tab-body{display:none}
 .tab-balance:disabled{opacity:1;filter:none;color:#eef2f8;transform:none;box-shadow:none}
+.tab-name{display:flex;flex-direction:column;gap:4px;margin:10px 0}
+.tab-address{font-family:ui-monospace,monospace;word-break:break-all}

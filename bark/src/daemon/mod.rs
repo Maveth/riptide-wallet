@@ -310,6 +310,17 @@ impl DaemonProcess {
 
 		// NB: a ticking interval needs Instant::now(), which panics on wasm,
 		// so the loop sleeps between iterations instead.
+		if let Some(wallet) = self.wallet() {
+			tokio::spawn(async move {
+				loop {
+					if let Err(err) = wallet.serve_lightning_address_once().await {
+						log::warn!("Lightning address receive: {err:#}");
+						tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+					}
+				}
+			});
+		}
+
 		loop {
 			// using if let to scope the wallet variable
 			if let Some(wallet) = self.wallet() {

@@ -52,6 +52,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/receives", get(list_receive_statuses))
 		.route("/sends/{identifier}", get(get_send_status))
 		.route("/pay", post(pay))
+		.route("/address", get(lightning_address).post(claim_lightning_address))
 		.route("/tab", get(lightning_tab))
 		.route("/tab/fund", post(fund_lightning_tab))
 		.route("/tab/return", post(return_lightning_tab))
@@ -352,6 +353,22 @@ pub async fn disable_offer(State(state): State<Arc<ServerState>>) -> HandlerResu
 }
 
 #[debug_handler]
+pub async fn lightning_address(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let address = wallet.lightning_address().await.context("Failed to read the Lightning address")?;
+	Ok(Json(serde_json::json!({ "address": address })))
+}
+
+pub async fn claim_lightning_address(
+	State(state): State<Arc<ServerState>>,
+	Json(body): Json<serde_json::Value>,
+) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+	let address = wallet.claim_lightning_address(name).await.context("Failed to claim the Lightning address")?;
+	Ok(Json(serde_json::json!({ "address": address })))
+}
+
 pub async fn lightning_tab(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
 	let wallet = state.require_wallet()?;
 	let (balance, opted_out) = wallet.lightning_tab_view().await

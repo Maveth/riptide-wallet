@@ -126,6 +126,52 @@ impl Wallet {
 		}
 	}
 
+	async fn address_key(&self) -> anyhow::Result<Keypair> {
+		self.tab_keys().await?.into_iter().next().context("no tab key")
+	}
+
+	pub async fn lightning_address(&self) -> anyhow::Result<String> {
+		let key = self.address_key().await?;
+		let (mut srv, _) = self.require_server().await?;
+		let resp = srv.client.get_lightning_address(self.tab_auth(&key, "balance", &[]).await)
+			.await.context("lightning address")?.into_inner();
+		Ok(resp.address)
+	}
+
+	pub async fn claim_lightning_address(&self, name: &str) -> anyhow::Result<String> {
+		let key = self.address_key().await?;
+		let (mut srv, _) = self.require_server().await?;
+		let resp = srv.client.claim_lightning_address(protos::ClaimLightningAddressRequest {
+			auth: Some(self.tab_auth(&key, "name", name.as_bytes()).await),
+			name: name.to_string(),
+		}).await.context("claim lightning address")?.into_inner();
+		Ok(resp.address)
+	}
+
+	/// Answer one coin-sized payment to this wallet's lightning address.
+	/// A zero amount means nobody asked during this wait.
+	pub async fn serve_lightning_address_once(&self) -> anyhow::Result<()> {
+		let key = self.address_key().await?;
+		let (mut srv, _) = self.require_server().await?;
+		let asked = srv.client.wait_lightning_address_coin(self.tab_auth(&key, "balance", &[]).await)
+			.await.context("wait for lightning address")?.into_inner();
+		if asked.amount_sat == 0 {
+			return Ok(());
+		}
+		let invoice = self.bolt11_invoice(
+			Amount::from_sat(asked.amount_sat),
+			Some(format!("Riptide {}", asked.amount_sat)),
+			None,
+		).await?;
+		let bolt11 = invoice.to_string();
+		let (mut srv, _) = self.require_server().await?;
+		srv.client.submit_lightning_address_invoice(protos::SubmitLightningAddressInvoiceRequest {
+			auth: Some(self.tab_auth(&key, "name-invoice", bolt11.as_bytes()).await),
+			bolt11,
+		}).await.context("submit lightning address invoice")?;
+		Ok(())
+	}
+
 	/// Sum of every funded tab held by a key in this wallet.
 	pub async fn lightning_tab_balance(&self) -> anyhow::Result<Amount> {
 		Ok(self.tab_snapshot().await?.0)
