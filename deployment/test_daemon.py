@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix='paperclip-platform-') as temporary:
             assert b'id="transaction-result"' in request('/', authenticated=False)
             assert b'id="wallet-readiness"' in request('/', authenticated=False)
             assert b"api('wallet')" in request('/app.js', authenticated=False)
-            assert b'value="https://ark.paperclippool.xyz"' in request('/', authenticated=False)
+            assert b'value="https://ark-riptide.maveth.ca"' in request('/', authenticated=False)
             assert b"api('/api/config')" in request('/app.js', authenticated=False)
             assert b'.setup-actions' in request('/style.css', authenticated=False)
             assert json.loads(request('/api/config'))['arkServer'] == 'https://operator.example'

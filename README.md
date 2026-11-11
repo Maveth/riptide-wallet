@@ -1,7 +1,7 @@
 # Paperclip Wallet · Beta
 
 A self-hosted Bitcoin Blake2b (XBT) wallet based on Bark by Second and the Bark
-contributors. This edition presets new wallets to **https://ark.paperclippool.xyz**.
+contributors. This edition presets new wallets to **https://ark-riptide.maveth.ca**.
 Existing wallet configuration is preserved. Wallet keys stay on your device.
 
 **Public beta. Paperclip Ark is open for XBT deposits, Ark transfers, and Lightning payments.**

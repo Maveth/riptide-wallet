@@ -46,7 +46,7 @@ fn ui_default_chain_source() -> String {
 }
 
 fn ui_default_ark_server() -> String {
-	"https://ark.paperclippool.xyz".to_owned()
+	"https://ark-riptide.maveth.ca".to_owned()
 }
 
 #[derive(Parser)]

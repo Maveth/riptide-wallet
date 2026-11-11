@@ -28,7 +28,7 @@ def package(platform, image, destination, app='paperclip-wallet'):
         write(out / 'umbrel-app.yml', {
             'manifestVersion': 1, 'id': app, 'name': 'Paperclip Wallet Beta', 'tagline': 'On-chain, Ark, and Lightning for XBT',
             'category': 'bitcoin', 'version': '0.9.3', 'port': 38180,
-            'description': 'Beta XBT wallet preset to https://ark.paperclippool.xyz. Configure your compatible XBT blockchain backend. Check live service status before funding. Back up the complete wallet.',
+            'description': 'Beta XBT wallet preset to https://ark-riptide.maveth.ca. Configure your compatible XBT blockchain backend. Check live service status before funding. Back up the complete wallet.',
             'developer': 'Paperclip', 'website': 'https://github.com/connorslab/paperclip-wallet-app',
             'repo': 'https://github.com/connorslab/paperclip-wallet-app',
             'support': 'https://github.com/connorslab/paperclip-wallet-app/issues',
@@ -41,7 +41,7 @@ def package(platform, image, destination, app='paperclip-wallet'):
             'wallet': {'image': image, 'user': '1000:1000', 'restart': 'unless-stopped',
                 'stop_grace_period': '2m', 'security_opt': ['no-new-privileges:true'],
                 'cap_drop': ['ALL'], 'volumes': ['${APP_DATA_DIR}/data:/data'],
-                'environment': {'APP_PASSWORD': '${APP_PASSWORD}', 'PAPERCLIP_XBT_MAINNET': '1', 'BARKD_UI_DEFAULT_ARK_SERVER': 'https://ark.paperclippool.xyz'}}
+                'environment': {'APP_PASSWORD': '${APP_PASSWORD}', 'PAPERCLIP_XBT_MAINNET': '1', 'BARKD_UI_DEFAULT_ARK_SERVER': 'https://ark-riptide.maveth.ca'}}
         }})
         (out / 'data').mkdir()
         (out / 'data/.gitkeep').touch()

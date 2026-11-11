@@ -17,6 +17,7 @@
 - Withdrawal needs at least 1,000 sats. A smaller tab is topped up first, then withdrawn in full. There is no withdrawal fee.
 - A coin is spent with the recovery shape already on that coin. That includes a zero-fee coin, an older 1,000 sat coin, and Paperclip's newer 330 plus 198 sat ordinary transfer when the server offers it.
 - The page is named Riptide and shows the tab balance between the Ark balance and the on-chain balance.
+- A new wallet defaults to `https://ark-riptide.maveth.ca`. That address answers from the public internet over HTTP/2.
 
 ## Left out
 

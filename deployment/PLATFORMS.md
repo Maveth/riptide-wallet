@@ -14,7 +14,7 @@ or recovery phrase. Existing credentials are preserved during an update.
 
 ## Connect your node
 
-New wallets default to `https://ark.paperclippool.xyz`. Custom server settings are
+New wallets default to `https://ark-riptide.maveth.ca`. Custom server settings are
 preserved. Choose an XBT/Blake2b-compatible node; a Bitcoin SHA-256 node cannot be
 used for this wallet.
 
