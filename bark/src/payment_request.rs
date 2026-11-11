@@ -760,12 +760,12 @@ impl Wallet {
 				PaymentInitOutput::Lightning(paid_invoice)
 			},
 			PaymentMethod::Offer(offer) => {
-				let paid_invoice = self.pay_lightning_offer(offer.clone(), input_amount, wait).await?;
+				let paid_invoice = self.pay_lightning_offer(offer.clone(), input_amount, wait, crate::LightningPaySource::Auto).await?;
 				PaymentInitOutput::Lightning(paid_invoice)
 			},
 			PaymentMethod::LightningAddress(address) => {
 				let amount = input_amount.context("amount is required for lightning address")?;
-				let paid_invoice = self.pay_lightning_address(&address, amount, comment, wait).await?;
+				let paid_invoice = self.pay_lightning_address(&address, amount, comment, wait, crate::LightningPaySource::Auto).await?;
 				PaymentInitOutput::Lightning(paid_invoice)
 			},
 			PaymentMethod::Ark(address) => {
@@ -775,7 +775,7 @@ impl Wallet {
 			},
 			PaymentMethod::Lnurl(lnurl) => {
 				let amount = input_amount.context("amount is required for lnurl payment")?;
-				let paid_invoice = self.pay_lnurl(&lnurl, amount, comment, wait).await?;
+				let paid_invoice = self.pay_lnurl(&lnurl, amount, comment, wait, crate::LightningPaySource::Auto).await?;
 				PaymentInitOutput::Lightning(paid_invoice)
 			},
 			PaymentMethod::OutputScript(_) => {

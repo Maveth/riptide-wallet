@@ -95,6 +95,11 @@ pub struct LightningSend {
 	pub progress: Progress,
 	/// Unless a developer allows it, we will not auto-exit the HTLCs if revocation fails.
 	pub allow_exit_of_htlcs: bool,
+
+	/// The invoice is under the dust floor, so Ark pays it from the funded tab.
+	/// No HTLC vtxo is built. Older checkpoints are ordinary Lightning sends.
+	#[serde(default)]
+	pub from_tab: bool,
 }
 
 impl LightningSend {
@@ -129,9 +134,32 @@ impl WalletAction for LightningSend {
 
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
 		let new_progress = match self.progress.clone() {
+			Progress::Start if self.from_tab => {
+				initiate_tab_payment(wallet, &self).await?;
+				Progress::TabPending
+			},
 			Progress::Start => {
 				let htlcs = request_lightning_send_htlcs(wallet, &self).await?;
 				Progress::HtlcReceived(htlcs)
+			},
+			Progress::TabPending => {
+				match check_tab_payment_status(wallet, &self, false).await? {
+					TabPaymentPoll::Settled { preimage, amount, fee } => {
+						settle_tab_payment(wallet, &self, preimage, amount, fee).await?;
+						return Ok(Advance::Done);
+					},
+					TabPaymentPoll::Failed => {
+						fail_tab_payment(wallet, &self).await?;
+						return Ok(Advance::Done);
+					},
+					TabPaymentPoll::Pending => {
+						return Ok(Advance::Park {
+							state: LightningSend { progress: Progress::TabPending, ..self },
+							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL),
+							error: None,
+						});
+					},
+				}
 			},
 			Progress::HtlcReceived(htlcs) => {
 				initiate_lightning_send_payment(wallet, &self, &htlcs).await?;
@@ -188,7 +216,7 @@ impl WalletAction for LightningSend {
 	/// that. A send that learns the preimage settles and holds nothing.
 	fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
 		match &self.progress {
-			Progress::AwaitingReimbursement { .. } => Vec::new(),
+			Progress::AwaitingReimbursement { .. } | Progress::TabPending => Vec::new(),
 			Progress::Start => self.input_vtxo_ids.clone(),
 			Progress::HtlcReceived(h)
 				| Progress::PaymentInitiated(h)
@@ -204,11 +232,12 @@ impl WalletAction for LightningSend {
 		match self.progress.clone() {
 			Progress::AwaitingReimbursement { .. } => {},
 			Progress::Start => {
-				if self.is_htlc_near_expiry(wallet).await? {
+				if !self.from_tab && self.is_htlc_near_expiry(wallet).await? {
 					let err = anyhow!("Could not start lightning send and HTLCs are near expiry");
 					return Ok(Advance::Failed(err));
 				}
 			},
+			Progress::TabPending => {},
 			Progress::HtlcReceived(htlcs) |
 			Progress::PaymentInitiated(htlcs) => {
 				if self.is_htlc_near_expiry(wallet).await? {
@@ -280,6 +309,9 @@ impl WalletAction for LightningSend {
 				};
 				Ok(Advance::Next(next))
 			},
+			Progress::TabPending => Ok(Advance::Park {
+				state: self, wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error),
+			}),
 			Progress::RevocationStuck { htlcs, .. } => {
 				if self.allow_exit_of_htlcs && self.is_htlc_near_expiry(wallet).await? {
 					exit_lightning_send_htlcs(wallet, &self, &htlcs).await?;
@@ -305,6 +337,8 @@ pub enum Progress {
 	HtlcReceived(Htlcs),
 	/// Server has been told to pay; outcome is pending.
 	PaymentInitiated(Htlcs),
+	/// Ark's normal Lightning send is paying from the tab. There is no HTLC vtxo.
+	TabPending,
 	/// Payment failed; HTLCs must be revoked back to a spendable vtxo.
 	RevocableHtlcs { htlcs: Htlcs, revocation: Revocation },
 	/// We've tried to revoke the HTLCs previously and failed, the user
@@ -343,6 +377,7 @@ impl Wallet {
 	/// checks every HTLC fragment and change output before any input is locked.
 	pub(crate) async fn plan_lightning_payment(
 		&self, amount: Amount, policy: VtxoPolicy, change: PublicKey,
+		service_fee: Option<Amount>,
 	) -> anyhow::Result<(Vec<WalletVtxo>, Amount, Amount)> {
 		let (_, info) = self.require_server().await?;
 		ensure!(info.funded_lightning, "server has not enabled funded Lightning");
@@ -354,10 +389,21 @@ impl Wallet {
 		let ids = candidates.iter().map(|v| v.id()).collect::<Vec<_>>();
 		let full = self.inner.db.get_full_vtxos(&ids).await?.into_iter()
 			.map(|v| (v.id(), v)).collect::<HashMap<_, _>>();
+		// The 500 sat coin is the older reserved exit. It cannot share a
+		// Lightning payment with the zero-fee board coin.
+		let candidates = candidates.into_iter().filter(|vtxo| {
+			full.get(&vtxo.id()).is_some_and(|full_vtxo| full_vtxo.has_zero_fee_exit())
+		}).collect::<Vec<_>>();
+		ensure!(!candidates.is_empty(),
+			"no spendable coin has the zero-fee exit this Lightning payment uses");
 		let (inputs, (fee, reserve)) = selection.select_constructible(candidates, |inputs| {
-			let fee = info.fees.lightning_send.calculate(amount, inputs.iter()
-				.map(|v| ark::fees::VtxoFeeInfo::from_vtxo_and_tip(v, tip)))
-				.context("Lightning service fee overflow")?;
+			let fee = if let Some(fixed) = service_fee {
+				fixed
+			} else {
+				info.fees.lightning_send.calculate(amount, inputs.iter()
+					.map(|v| ark::fees::VtxoFeeInfo::from_vtxo_and_tip(v, tip)))
+					.context("Lightning service fee overflow")?
+			};
 			let total = amount.checked_add(fee).context("payment amount overflow")?;
 			let hydrated = inputs.iter().map(|v| full.get(&v.id()).cloned()
 				.context("Missing Lightning input ancestry")).collect::<anyhow::Result<Vec<_>>>()?;
@@ -366,7 +412,9 @@ impl Wallet {
 				VtxoPolicy::new_pubkey(change),
 			) {
 				Ok((_, reserve)) => Ok(Some((fee, reserve))),
-				Err(ArkoorConstructionError::Dust | ArkoorConstructionError::Unbalanced { .. }) => Ok(None),
+				Err(ArkoorConstructionError::Dust
+					| ArkoorConstructionError::Unbalanced { .. }
+					| ArkoorConstructionError::IncompatibleExitFunding) => Ok(None),
 				Err(error) => Err(error.into()),
 			}
 		})?;
@@ -385,6 +433,7 @@ pub(crate) async fn start_lightning_send(
 	invoice: Invoice,
 	user_amount: Option<Amount>,
 	original_payment_method: PaymentMethod,
+	source: crate::LightningPaySource,
 ) -> anyhow::Result<LightningSend> {
 	let (_, ark_info) = wallet.require_server().await?;
 	ensure!(ark_info.funded_lightning, "server has not enabled funded Lightning");
@@ -406,12 +455,64 @@ pub(crate) async fn start_lightning_send(
 		bail!("Cannot pay invoice for 0 sats (0 sat invoices are not any-amount invoices)");
 	}
 
+	let under_floor = payment_amount < ark::lightning::lightning_tab_floor();
+	let use_tab = match source {
+		crate::LightningPaySource::Tab => true,
+		crate::LightningPaySource::Coin => {
+			ensure!(!under_floor, "an invoice under {} sats cannot be an Ark coin. Top up the tab once, then pay from the tab.",
+				ark::lightning::lightning_tab_floor().to_sat());
+			false
+		},
+		crate::LightningPaySource::Auto => under_floor,
+	};
+	if under_floor && wallet.lightning_tab_opted_out().await? {
+		bail!("small Lightning payments are off. Turn the tab back on to pay under {} sats.",
+			ark::lightning::lightning_tab_floor().to_sat());
+	}
+	if use_tab {
+		let quoted = wallet.lightning_service_fee_quote(&invoice, payment_amount).await?;
+		let fee = match quoted {
+			Some(fee) => fee,
+			None => ark_info.fees.lightning_send.calculate(payment_amount, std::iter::empty())
+				.context("Lightning tab fee overflow")?,
+		};
+		let total = payment_amount.checked_add(fee).context("Lightning tab total overflow")?;
+		let key = wallet.tab_pay_key(total).await?;
+		let movement_id = wallet.inner.movements.new_movement_with_update(
+			Subsystem::LIGHTNING_SEND,
+			LightningSendMovement::Send.to_string(),
+			MovementUpdate::new()
+				.intended_balance(-payment_amount.to_signed().context("payment amount out of range")?)
+				.fee(fee)
+				.sent_to([MovementDestination::new(original_payment_method.clone(), payment_amount)])
+				.metadata(LightningMovement::metadata(invoice.payment_hash(), Vec::<VtxoId>::new(), None)),
+		).await.context("failed to create lightning-send movement")?;
+		return Ok(LightningSend {
+			invoice,
+			original_payment_method,
+			input_vtxo_ids: Vec::new(),
+			payment_amount,
+			fee,
+			recovery_reserve: Amount::ZERO,
+			change_pieces: None,
+			htlc_key: key.public_key(),
+			htlc_expiry: tip + ark_info.htlc_send_expiry_delta,
+			movement_id: Some(movement_id),
+			revocation_key: None,
+			allow_exit_of_htlcs: false,
+			from_tab: true,
+			progress: Progress::Start,
+		});
+	}
+
+	let service_fee = wallet.lightning_service_fee_quote(&invoice, payment_amount).await?;
 	let (preview_key, _) = wallet.peek_next_keypair().await?;
 	let htlc_expiry = tip + ark_info.htlc_send_expiry_delta;
 	let (inputs, fee, recovery_reserve) = wallet.plan_lightning_payment(
 		payment_amount,
 		VtxoPolicy::new_server_htlc_send(preview_key.public_key(), invoice.payment_hash(), htlc_expiry),
 		preview_key.public_key(),
+		service_fee,
 	).await?;
 	let (change_keypair, _) = wallet.derive_store_next_keypair().await?;
 	let (revocation_keypair, _) = wallet.derive_store_next_keypair().await?;
@@ -442,6 +543,7 @@ pub(crate) async fn start_lightning_send(
 		movement_id: Some(movement_id),
 		revocation_key: Some(revocation_keypair.public_key()),
 		allow_exit_of_htlcs: false,
+		from_tab: false,
 		progress: Progress::Start,
 	})
 }
@@ -586,10 +688,136 @@ pub(crate) async fn initiate_lightning_send_payment(
 		htlc_vtxo_ids: htlcs.vtxo_ids.iter().map(|v| v.to_bytes().to_vec()).collect(),
 		payment_amount_sat: send.payment_amount.to_sat(),
 		mailbox_id: Some(htlcs.mailbox_id.serialize()),
+		tab_user_pubkey: None,
+		tab_signature: None,
 	};
 	srv.client.initiate_lightning_payment(req).await
 		.map_err(AdvanceError::Server)?;
 
+	Ok(())
+}
+
+/// Tell Ark's normal Lightning send to pay this invoice from the tab.
+async fn initiate_tab_payment(wallet: &Wallet, send: &LightningSend) -> Result<(), AdvanceError> {
+	let key = wallet.pubkey_keypair(&send.htlc_key).await?
+		.context("Lightning tab key is not in this wallet")?.1;
+	let invoice = send.invoice.to_string();
+	let (mut srv, _) = wallet.require_server().await?;
+	let req = protos::InitiateLightningPaymentRequest {
+		invoice: invoice.clone(),
+		htlc_vtxo_ids: Vec::new(),
+		payment_amount_sat: send.payment_amount.to_sat(),
+		mailbox_id: None,
+		tab_user_pubkey: Some(key.public_key().serialize().to_vec()),
+		tab_signature: Some(crate::lightning::tab::tab_signature(&key, "pay", invoice.as_bytes())),
+	};
+	srv.client.initiate_lightning_payment(req).await.map_err(AdvanceError::Server)?;
+	Ok(())
+}
+
+enum TabPaymentPoll {
+	Pending,
+	Failed,
+	Settled { preimage: Preimage, amount: Amount, fee: Amount },
+}
+
+async fn check_tab_payment_status(
+	wallet: &Wallet, send: &LightningSend, wait: bool,
+) -> anyhow::Result<TabPaymentPoll> {
+	let (mut srv, _) = wallet.require_server().await?;
+	let payment_hash = send.invoice.payment_hash();
+	let req = protos::CheckLightningPaymentRequest { hash: payment_hash.to_vec(), wait };
+	let response = srv.client.check_lightning_payment(req).await
+		.map(|r| r.into_inner().payment_status);
+	match response {
+		Ok(Some(lightning_payment_status::PaymentStatus::Success(s))) => {
+			match Preimage::try_from(s.preimage) {
+				Ok(preimage) if preimage.compute_payment_hash() == payment_hash => {
+					let amount = s.amount_sat.map(Amount::from_sat).unwrap_or(send.payment_amount);
+					let fee = s.fee_sat.map(Amount::from_sat).unwrap_or(send.fee);
+					Ok(TabPaymentPoll::Settled { preimage, amount, fee })
+				},
+				_ => Ok(TabPaymentPoll::Pending),
+			}
+		},
+		Ok(Some(lightning_payment_status::PaymentStatus::Failed(_))) => Ok(TabPaymentPoll::Failed),
+		Ok(Some(lightning_payment_status::PaymentStatus::Pending(_))) | Ok(None) | Err(_) => {
+			Ok(TabPaymentPoll::Pending)
+		},
+	}
+}
+
+async fn settle_tab_payment(
+	wallet: &Wallet, send: &LightningSend, preimage: Preimage, amount: Amount, fee: Amount,
+) -> anyhow::Result<()> {
+	let payment_hash = send.invoice.payment_hash();
+	if preimage.compute_payment_hash() != payment_hash {
+		bail!("preimage does not match payment hash {}", payment_hash);
+	}
+	wallet.inner.db.record_paid_invoice(payment_hash, preimage).await?;
+	if let Some(movement) = send.movement_id {
+		let paid = amount.checked_add(fee).context("settled tab payment overflow")?;
+		wallet.inner.movements.finish_movement_with_update(
+			movement, MovementStatus::Successful,
+			MovementUpdate::new()
+				.effective_balance(-paid.to_signed().context("settled tab amount out of range")?)
+				.fee(fee)
+				.metadata([(
+					"payment_preimage".into(),
+					serde_json::to_value(preimage).expect("payment preimage can serde"),
+				)]),
+		).await?;
+	}
+	Ok(())
+}
+
+/// A settled tab send used to record a zero balance change. Fill it with the
+/// invoice plus the fee the server kept, once that payment has succeeded.
+pub async fn repair_settled_tab_sends(wallet: &Wallet) -> anyhow::Result<()> {
+	let movements = wallet.inner.db.get_all_movements().await?;
+	for movement in movements {
+		if !movement.subsystem.is_subsystem(Subsystem::LIGHTNING_SEND) {
+			continue;
+		}
+		if movement.status != MovementStatus::Successful || movement.effective_balance != SignedAmount::ZERO {
+			continue;
+		}
+		if !movement.input_vtxos.is_empty() {
+			continue;
+		}
+		let Some(raw_hash) = movement.metadata.get("payment_hash") else { continue };
+		let hash: ark::lightning::PaymentHash = serde_json::from_value(raw_hash.clone())
+			.context("stored lightning payment hash")?;
+		let (mut srv, _) = wallet.require_server().await?;
+		let response = srv.client.check_lightning_payment(protos::CheckLightningPaymentRequest {
+			hash: hash.to_vec(),
+			wait: false,
+		}).await?.into_inner().payment_status;
+		let Some(lightning_payment_status::PaymentStatus::Success(success)) = response else {
+			continue;
+		};
+		let (Some(amount_sat), Some(fee_sat)) = (success.amount_sat, success.fee_sat) else {
+			continue;
+		};
+		let paid = Amount::from_sat(amount_sat).checked_add(Amount::from_sat(fee_sat))
+			.context("settled tab payment overflow")?;
+		wallet.inner.movements.update_movement(
+			movement.id,
+			MovementUpdate::new()
+				.effective_balance(-paid.to_signed().context("settled tab amount out of range")?)
+				.fee(Amount::from_sat(fee_sat)),
+		).await?;
+	}
+	Ok(())
+}
+
+async fn fail_tab_payment(wallet: &Wallet, send: &LightningSend) -> anyhow::Result<()> {
+	if let Some(movement) = send.movement_id {
+		wallet.inner.movements.finish_movement_with_update(
+			movement, MovementStatus::Failed,
+			MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO),
+		).await?;
+	}
 	Ok(())
 }
 

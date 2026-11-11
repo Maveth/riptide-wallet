@@ -52,6 +52,12 @@ async function updateBalances(sessionToken) {
   const [balance, chain, vtxos, exits, tip] = results.map(result => result.status === 'fulfilled' ? result.value : null);
   $('exits').textContent = JSON.stringify(exits, null, 2);
   $('ark-balance').textContent = Number.isSafeInteger(balance?.spendable_sat) ? balance.spendable_sat.toLocaleString() : 'Unavailable';
+  const tab = await api('lightning/tab').catch(() => null);
+  if ($('tab-balance')) $('tab-balance').textContent = Number.isSafeInteger(tab?.balance_sat) ? tab.balance_sat.toLocaleString() : '—';
+  if ($('ln-tab-balance')) $('ln-tab-balance').textContent = Number.isSafeInteger(tab?.balance_sat) ? tab.balance_sat.toLocaleString() : '—';
+  if ($('ln-tab-return')) $('ln-tab-return').disabled = !(Number.isSafeInteger(tab?.balance_sat) && tab.balance_sat >= 1000);
+  if ($('ln-tab-opt') && tab) $('ln-tab-opt').checked = tab.opted_out === true;
+  syncTabCard();
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
   vtxoSnapshot = {balance: balance || {}, rows: Array.isArray(vtxos) ? vtxos : [], tip: Number.isSafeInteger(tip?.tip_height) ? tip.tip_height : null};
@@ -262,42 +268,170 @@ $('chain-send').onsubmit = event => { event.preventDefault(); run(event.submitte
   transactionResult('pending', 'Transaction submitted', 'Waiting for confirmation on the XBT network. Do not send it again.', result.txid);
   status('Transaction submitted. Wait for confirmation; do not send again.');
 }); };
+
+function resetReviewChoices() {
+  const topup = $('review-topup'), tab = $('review-tab'), confirm = $('review-confirm');
+  if (topup) topup.hidden = true;
+  if (tab) tab.hidden = true;
+  if (confirm) { confirm.hidden = false; confirm.textContent = 'Confirm'; confirm.value = 'confirm'; }
+}
+async function reviewConfirm(title, body) {
+  const dialog = $('review-dialog');
+  resetReviewChoices();
+  if (!dialog || typeof dialog.showModal !== 'function') return window.confirm(title + '\n\n' + body);
+  $('review-title').textContent = title;
+  $('review-body').textContent = body;
+  dialog.returnValue = '';
+  dialog.showModal();
+  return await new Promise(resolve => {
+    const onClose = () => { dialog.removeEventListener('close', onClose); resetReviewChoices(); resolve(dialog.returnValue === 'confirm'); };
+    dialog.addEventListener('close', onClose);
+  });
+}
+async function reviewPay(title, body, choices) {
+  const dialog = $('review-dialog');
+  resetReviewChoices();
+  if (!dialog || typeof dialog.showModal !== 'function') {
+    if (choices.tab && !choices.coin) return window.confirm(title + '\n\n' + body) ? 'tab' : null;
+    if (choices.coin && window.confirm(title + '\n\n' + body + '\n\nOK pays from your Ark coin. Cancel to stop.')) return 'coin';
+    return null;
+  }
+  $('review-title').textContent = title;
+  $('review-body').textContent = body;
+  $('review-confirm').hidden = !choices.coin;
+  $('review-confirm').textContent = 'Pay from my coin';
+  $('review-confirm').value = 'coin';
+  $('review-tab').hidden = !choices.tab;
+  $('review-topup').hidden = !choices.topup;
+  dialog.returnValue = '';
+  dialog.showModal();
+  return await new Promise(resolve => {
+    const onClose = () => {
+      dialog.removeEventListener('close', onClose);
+      resetReviewChoices();
+      const value = dialog.returnValue;
+      resolve(value === 'coin' || value === 'tab' || value === 'topup' ? value : null);
+    };
+    dialog.addEventListener('close', onClose);
+  });
+}
+async function topUpOnce() {
+  const result = await mutate('lightning/tab/fund', {});
+  if ($('ln-tab-balance') && Number.isSafeInteger(result.balance_sat)) $('ln-tab-balance').textContent = result.balance_sat.toLocaleString();
+  await update();
+  status('Topped up 1,000 sats once. No invoice was paid. Balance: ' + (Number.isSafeInteger(result.balance_sat) ? result.balance_sat.toLocaleString() : 'updated') + ' sats.');
+}
+function syncTabCard() {
+  const card = $('ln-tab-card');
+  if (!card || !$('ln-tab-opt')) return;
+  card.classList.toggle('opted-out', $('ln-tab-opt').checked === true);
+}
 $('ln-pay').onsubmit = event => { event.preventDefault(); run(event.submitter, async () => {
   if (!lightningEnabled) throw new Error('Lightning is not enabled in this wallet recovery profile.');
   const destination = $('ln-destination').value.trim(), amount = sats('ln-amount', true);
   const paymentSession = token;
   if (!destination) throw new Error('Enter an XBT Lightning request.');
-  let costs = 'Service fees plus 4,000\u20136,000 sats of recovery reserves per input apply.';
-  if (amount !== null) {
-    const quote = await api('fees/lightning/pay?amount_sat=' + amount);
-    if (![quote.gross_amount_sat, quote.fee_sat, quote.net_amount_sat].every(Number.isSafeInteger) || quote.net_amount_sat !== amount || quote.fee_sat < 0 || quote.gross_amount_sat !== amount + quote.fee_sat) throw new Error('Invalid Lightning estimate. No payment was sent.');
-    costs = 'Estimated total: ' + quote.gross_amount_sat.toLocaleString() + ' sats\nIncludes ' + quote.fee_sat.toLocaleString() + ' sats in service fees and recovery reserves.\nEstimate may change if wallet funds or server fees change.';
+  let fromTab = false;
+  let quote = null;
+  let costs = 'Paste an invoice to price the route. If no route cost is found, the schedule fee applies. A payment that cannot be routed is not sent.';
+  const params = new URLSearchParams();
+  if (amount !== null) params.set('amount_sat', String(amount));
+  if (destination) params.set('invoice', destination);
+  if ([...params.keys()].length) {
+    quote = await api('fees/lightning/pay?' + params.toString());
+    if (![quote.gross_amount_sat, quote.fee_sat, quote.net_amount_sat].every(Number.isSafeInteger) || quote.fee_sat < 0 || quote.gross_amount_sat !== quote.net_amount_sat + quote.fee_sat) throw new Error('Invalid Lightning estimate. No payment was sent.');
+    if (amount !== null && quote.net_amount_sat !== amount) throw new Error('Invalid Lightning estimate. No payment was sent.');
+    if (quote.tab_required === true || quote.from_tab === true) {
+      fromTab = true;
+      costs = quote.route_priced === false
+        ? 'The route fee is not known yet. The tab will hold ' + quote.fee_sat.toLocaleString() + ' sats, on top of the ' + quote.net_amount_sat.toLocaleString() + ' sat invoice.\nAfter the payment, the tab keeps the route cost plus 1 sat and puts the rest back.\nA unilateral exit forfeits whatever is still on the tab.'
+        : 'This invoice is under 1,000 sats, so it is paid from the tab.\nInvoice ' + quote.net_amount_sat.toLocaleString() + ' sats plus ' + quote.fee_sat.toLocaleString() + ' sats from the tab.\nArk pays it. No new coin is created. A unilateral exit forfeits the leftover tab.';
+    } else {
+      costs = 'Estimated total from your coin: ' + quote.gross_amount_sat.toLocaleString() + ' sats\nIncludes ' + quote.fee_sat.toLocaleString() + ' sats.\nA found route is charged as that route plus 1 sat. Otherwise this is the schedule fee. The payment is not sent when it cannot be routed.';
+    }
   }
   if (!token || token !== paymentSession || $('wallet').hidden || destination !== $('ln-destination').value.trim() || amount !== sats('ln-amount', true)) throw new Error('Payment details changed. Review them again. No payment was sent.');
-  if (!await PaperclipReview.ask('Pay ' + (amount === null ? 'the invoice amount' : amount.toLocaleString() + ' sats') + ' from Ark on ' + network + '?\n' + destination + '\n\n' + costs + '\nFailed payments may also consume refund reserves.')) return;
-  if (!token || token !== paymentSession || destination !== $('ln-destination').value.trim() || amount !== sats('ln-amount', true)) throw new Error('Payment details changed. Review again.');
-  const result = await mutate('lightning/pay', {destination, amount_sat: amount, comment: null});
-  if (!token || token !== paymentSession || $('wallet').hidden) return;
+  const tabNow = await api('lightning/tab').catch(() => null);
+  const tabBalance = Number.isSafeInteger(tabNow?.balance_sat) ? tabNow.balance_sat : 0;
+  let tabAffordable = false;
+  if (!fromTab) {
+    try {
+      const tabParams = new URLSearchParams(params);
+      tabParams.set('source', 'tab');
+      const tabQuote = await api('fees/lightning/pay?' + tabParams.toString());
+      tabAffordable = tabQuote.from_tab === true && tabBalance >= tabQuote.gross_amount_sat && tabQuote.gross_amount_sat === tabQuote.net_amount_sat + tabQuote.fee_sat;
+      if (tabAffordable) costs += '\n\nThe tab can also pay this: ' + tabQuote.gross_amount_sat.toLocaleString() + ' sats, with no new coin.';
+    } catch { tabAffordable = false; }
+  } else {
+    tabAffordable = tabBalance >= quote.gross_amount_sat;
+    if (!tabAffordable) costs += '\n\nThe tab has ' + tabBalance.toLocaleString() + ' sats. Top up 1,000 once, then review this payment again.';
+  }
+  const picked = await reviewPay('Lightning payment', 'Pay ' + (amount === null ? 'the invoice amount' : amount.toLocaleString() + ' sats') + ' on ' + network + '?\n' + destination + '\n\n' + costs, {
+    coin: !fromTab, tab: tabAffordable, topup: true
+  });
+  if (picked === 'topup') { await topUpOnce(); return; }
+  if (picked !== 'coin' && picked !== 'tab') return;
+  fromTab = picked === 'tab';
+  const result = await mutate('lightning/pay', {destination, amount_sat: amount, comment: null, source: picked});
   $('ln-result').textContent = JSON.stringify(result, null, 2);
   paymentSummary('Submitted', 'Payment submitted once. Check Sent status before trying again.');
-  transactionResult('pending', 'Payment submitted', 'Check Sent status to confirm whether the Lightning payment succeeded. Do not send it again.', result.payment_hash);
   if (result.payment_hash) { $('ln-identifier').value = result.payment_hash; $('ln-direction').value = 'sends'; }
   $('ln-destination').value = ''; $('ln-amount').value = '';
-  status('Payment submitted. Check its status before making another payment.');
+  status(fromTab ? 'Tab payment submitted through Ark. Check its status before another payment.' : 'Payment submitted. Check its status before making another payment.');
+  await update();
 }); };
+$('ln-tab-return').onclick = event => run(event.target, async () => {
+  if (!lightningEnabled) throw new Error('Lightning is not enabled in this wallet recovery profile.');
+  if (!await reviewConfirm('Withdraw all to coin', 'Ask the server to pay the whole tab back into coins?\n\nIt is all or nothing, and there is no fee. Under 1,000 sats, top up once, then withdraw all. You can top up 1,000 again afterwards.')) return;
+  const result = await mutate('lightning/tab/return', {});
+  if ($('ln-tab-balance') && Number.isSafeInteger(result.balance_sat)) $('ln-tab-balance').textContent = result.balance_sat.toLocaleString();
+  await update();
+  status('Moved ' + (Number.isSafeInteger(result.amount_sat) ? result.amount_sat.toLocaleString() : 'the tab') + ' sats from the tab into a coin.');
+});
+$('ln-tab-fund').onclick = event => run(event.target, async () => {
+  if (!lightningEnabled) throw new Error('Lightning is not enabled in this wallet recovery profile.');
+  if (!await reviewConfirm('Top up 1,000 once', 'Send 1,000 sats from an existing Ark coin into the tab?\n\nThis happens once. It does not repeat, and it does not pay an invoice.\nYour change stays your coin. A unilateral exit forfeits whatever is left.')) return;
+  await topUpOnce();
+});
+function syncTabCard() {
+  const card = $('ln-tab-card');
+  if (!card || !$('ln-tab-opt')) return;
+  card.classList.toggle('opted-out', $('ln-tab-opt').checked === true);
+}
+$('ln-tab-opt').onchange = event => run(event.target, async () => {
+  const optedOut = event.target.checked === true;
+  syncTabCard();
+  if (optedOut && !await reviewConfirm('Opt out of small payments', 'Turn off payments under 1,000 sats?\n\nYou will not be able to send or receive them. A balance already on the tab stays there until you turn this back on or exit.')) {
+    event.target.checked = false;
+    syncTabCard();
+    return;
+  }
+  const result = await mutate('lightning/tab/opt', { opted_out: optedOut });
+  event.target.checked = result.opted_out === true;
+  syncTabCard();
+  status(result.opted_out ? 'Small payments are off.' : 'Small payments use the tab.');
+});
 $('ln-receive').onsubmit = event => { event.preventDefault(); run(event.submitter, async () => {
   if (!lightningEnabled) throw new Error('Lightning is not enabled in this wallet recovery profile.');
   const receiveSession = token;
   const amount = sats('ln-receive-amount');
+  if ($('ln-tab-opt') && $('ln-tab-opt').checked && amount < 1000) {
+    throw new Error('Small payments are off. Turn the tab back on to receive under 1,000 sats.');
+  }
   const result = await mutate('lightning/receives/invoice', {
     amount_sat: amount, description: $('ln-description').value.trim() || null, token: null
   });
   if (!token || token !== receiveSession || $('wallet').hidden) return;
   $('ln-invoice').textContent = result.invoice; $('ln-copy').hidden = true;
-  PaperclipReceive.show('ln-invoice', result.invoice, 'Receive Lightning into Ark');
-  paymentSummary('Awaiting payment', 'Share this invoice. Keep the wallet online until settlement completes.');
+  PaperclipReceive.show('ln-invoice', result.invoice, amount < 1000 ? 'Receive into the tab' : 'Receive Lightning into Ark');
+  paymentSummary('Awaiting payment', amount < 1000
+    ? 'This amount is under 1,000 sats, so a payment credits the tab in full. No Ark coin is created.'
+    : 'Share this invoice. Keep the wallet online until settlement completes.');
   $('ln-identifier').value = result.invoice; $('ln-direction').value = 'receives';
-  status('Invoice created. A payment is not settled until the wallet reports completion.');
+  status(amount < 1000
+    ? 'Invoice created. A payment credits the tab. No coin is created.'
+    : 'Invoice created. A payment is not settled until the wallet reports completion.');
+  await update();
 }); };
 $('ln-check').onsubmit = event => { event.preventDefault(); run(event.submitter, async () => {
   const identifier = $('ln-identifier').value.trim(), direction = $('ln-direction').value;

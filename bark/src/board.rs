@@ -250,33 +250,62 @@ impl Wallet {
 			"board amount of {amount} is less than minimum board amount required by server ({})",
 			ark_info.min_board_amount,
 		);
-		let anchor = ark_info.fees.board.calculate(amount).context("fee overflowed")?
-			.max(ark::exit_policy::paperclip_funding().anchor());
-		let miner_fee = ark::exit_policy::paperclip_funding().miner_fee();
-		let fee = anchor.checked_add(miner_fee).context("board reserve overflow")?;
+		let fee = ark_info.fees.board.calculate(amount).context("fee overflowed")?;
 		validate_and_subtract_fee(amount, fee)?;
 
 		let utxo = OutPoint::new(board_psbt.unsigned_tx.compute_txid(), vout);
-		let builder = builder
-			.with_exit_format(bitcoin_ext::fee::ExitFormat::StandardV2)
-			.set_funded_funding_details(amount, anchor, miner_fee, utxo)
+		let funding_tx = bitcoin::consensus::serialize(&board_psbt.unsigned_tx);
+		let user_pubkey = user_keypair.public_key().serialize().to_vec();
+		// Ask for the zero-fee board first. Our server signs it. An older server
+		// ignores `zero_fee_board` and signs the 1,000 plus 1,000 board, so the
+		// check below fails and we ask again in that shape.
+		let zero_builder = builder
+			.set_zero_fee_board_details(amount, fee, utxo)
 			.context("error setting funding details for board")?
 			.generate_user_nonces();
-
-		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
+		let zero_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
 			exit_profile: ark::exit_policy::PAPERCLIP_EXIT_PROFILE,
 			amount: amount.to_sat(),
-			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own
+			utxo: bitcoin::consensus::serialize(&utxo),
 			expiry_height: expiry_height.into(),
-			user_pubkey: user_keypair.public_key().serialize().to_vec(),
-			pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
-			funding_tx: bitcoin::consensus::serialize(&board_psbt.unsigned_tx),
+			user_pubkey: user_pubkey.clone(),
+			pub_nonce: zero_builder.user_pub_nonce().serialize().to_vec(),
+			funding_tx: funding_tx.clone(),
+			zero_fee_board: true,
 		}).await.context("error requesting board cosign")?
 			.into_inner().try_into().context("invalid cosign response from server")?;
-
-		ensure!(builder.verify_cosign_response(&cosign_resp),
-				"invalid board cosignature received from server",
-			);
+		let (builder, cosign_resp) = if zero_builder.verify_cosign_response(&zero_resp) {
+			(zero_builder, zero_resp)
+		} else {
+			// This server signed the older 1,000 sat anchor and 1,000 sat miner-fee board.
+			let anchor = fee.max(Amount::from_sat(1000));
+			let miner_fee = Amount::from_sat(1000);
+			let reserve = anchor.checked_add(miner_fee).context("board reserve overflow")?;
+			validate_and_subtract_fee(amount, reserve)?;
+			let standard_builder = BoardBuilder::new(
+				user_keypair.public_key(),
+				expiry_height,
+				ark_info.server_pubkey,
+				ark_info.vtxo_exit_delta,
+			).with_exit_format(bitcoin_ext::fee::ExitFormat::StandardV2)
+				.set_funded_funding_details(amount, anchor, miner_fee, utxo)
+				.context("error setting standard funding details for board")?
+				.generate_user_nonces();
+			let standard_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
+				exit_profile: ark::exit_policy::PAPERCLIP_EXIT_PROFILE,
+				amount: amount.to_sat(),
+				utxo: bitcoin::consensus::serialize(&utxo),
+				expiry_height: expiry_height.into(),
+				user_pubkey,
+				pub_nonce: standard_builder.user_pub_nonce().serialize().to_vec(),
+				funding_tx,
+				zero_fee_board: false,
+			}).await.context("error requesting standard board cosign")?
+				.into_inner().try_into().context("invalid cosign response from server")?;
+			ensure!(standard_builder.verify_cosign_response(&standard_resp),
+				"invalid board cosignature received from server");
+			(standard_builder, standard_resp)
+		};
 
 		// Cosign and vtxo construction need the user keypair (and the funding
 		// PSBT came from the on-chain wallet), neither of which the action can

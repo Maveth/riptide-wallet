@@ -82,6 +82,9 @@ pub struct LightningReceive {
 	/// Index of the wallet key backing the HTLC-recv vtxo and, for local
 	/// receives, the claim output.
 	pub key_index: u32,
+	/// Under the dust floor. The payment credits the tab instead of a coin.
+	#[serde(default)]
+	pub from_tab: bool,
 
 	// Mutable state:
 	pub progress: Progress,
@@ -117,6 +120,17 @@ impl WalletAction for LightningReceive {
 					IncomingStatus::Canceled => {
 						let err = anyhow!("Lightning receive {} canceled server-side", self.payment_hash);
 						return Ok(Advance::Failed(err));
+					},
+					IncomingStatus::TabCredit => {
+						wallet.settle_lightning_tab_receive(
+							self.payment_hash, self.payment_preimage,
+						).await.map_err(AdvanceError::from)?;
+						let amount = self.invoice.get_payment_amount(None)
+							.context("missing invoice amount")?;
+						wallet.inner.db.record_settled_lightning_receive(
+							self.payment_hash, self.payment_preimage, &self.invoice, amount,
+						).await.map_err(AdvanceError::from)?;
+						return Ok(Advance::Done);
 					},
 					IncomingStatus::Ready => {
 						match prepare_lightning_receive_htlcs(wallet, &self).await? {
@@ -310,6 +324,8 @@ pub(crate) enum IncomingStatus {
 	Pending,
 	/// The server is holding HTLCs ready for us to prepare and claim.
 	Ready,
+	/// A small payment has arrived and should be credited to the tab.
+	TabCredit,
 	/// The server canceled the hold invoice; nothing to claim.
 	Canceled,
 }
@@ -337,8 +353,20 @@ pub(crate) async fn start_lightning_receive(
 	ensure!(ark_info.funded_lightning, "server has not enabled funded Lightning");
 	let config = wallet.config();
 
-	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
-	validate_and_subtract_fee(amount, fee)?;
+	let from_tab = amount < ark::lightning::lightning_tab_floor();
+	if from_tab {
+		if claim_destination.is_some() {
+			bail!("a receive under {} sats credits the Lightning tab and cannot be forwarded to an Ark address",
+				ark::lightning::lightning_tab_floor().to_sat());
+		}
+		if wallet.lightning_tab_opted_out().await? {
+			bail!("small Lightning payments are off. Turn the tab back on to receive under {} sats.",
+				ark::lightning::lightning_tab_floor().to_sat());
+		}
+	} else {
+		let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
+		validate_and_subtract_fee(amount, fee)?;
+	}
 
 	// User needs to enforce the following delta:
 	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
@@ -371,6 +399,10 @@ pub(crate) async fn start_lightning_receive(
 		min_cltv_delta: requested_min_cltv_delta.into(),
 		mailbox_id: Some(mailbox_id.serialize()),
 		description,
+		tab_user_pubkey: from_tab.then(|| mailbox_kp.public_key().serialize().to_vec()),
+		tab_signature: from_tab.then(|| crate::lightning::tab::tab_signature(
+			&mailbox_kp, "receive", payment_hash.as_ref(),
+		)),
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
@@ -391,8 +423,32 @@ pub(crate) async fn start_lightning_receive(
 		anti_dos_token: token,
 		claim_destination,
 		key_index,
+		from_tab,
 		progress: Progress::AwaitingPayment,
 	})
+}
+
+pub(crate) fn register_bolt12_request(
+	wallet: &Wallet,
+	recv: &LightningReceive,
+) -> protos::RegisterBolt12ReceiveRequest {
+	let key = wallet.inner.seed.to_mailbox_keypair();
+	let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key());
+	let (tab_user_pubkey, tab_signature) = if recv.from_tab {
+		(
+			Some(key.public_key().serialize().to_vec()),
+			Some(crate::lightning::tab::tab_signature(&key, "receive", recv.payment_hash.as_ref())),
+		)
+	} else {
+		(None, None)
+	};
+	protos::RegisterBolt12ReceiveRequest {
+		invoice: recv.invoice.to_string(),
+		min_cltv_delta: recv.htlc_recv_cltv_delta.into(),
+		mailbox_id: Some(mailbox.serialize()),
+		tab_user_pubkey,
+		tab_signature,
+	}
 }
 
 /// Build the anti-dos proof for a claim: an explicit token if the caller
@@ -435,10 +491,8 @@ pub(crate) async fn check_incoming_lightning_payment(
 	let response = match response {
 		Err(error) if error.code() == tonic::Code::NotFound && matches!(recv.invoice, Invoice::Bolt12(_)) => {
 			if invoice_expired(&recv.invoice) { return Ok(IncomingStatus::Canceled); }
-			let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(wallet.inner.seed.to_mailbox_keypair().public_key());
-			srv.client.register_bolt12_receive(protos::RegisterBolt12ReceiveRequest {
-				invoice: recv.invoice.to_string(), min_cltv_delta: recv.htlc_recv_cltv_delta.into(), mailbox_id: Some(mailbox.serialize()),
-			}).await.map_err(AdvanceError::Server)?;
+			srv.client.register_bolt12_receive(register_bolt12_request(wallet, recv))
+				.await.map_err(AdvanceError::Server)?;
 			srv.client.check_lightning_receive(query).await
 		},
 		other => other,
@@ -450,6 +504,8 @@ pub(crate) async fn check_incoming_lightning_payment(
 	debug!("Received status {:?} for {}", status, recv.payment_hash);
 
 	Ok(match status {
+		protos::LightningReceiveStatus::Accepted if recv.from_tab => IncomingStatus::TabCredit,
+		protos::LightningReceiveStatus::Settled if recv.from_tab => IncomingStatus::TabCredit,
 		protos::LightningReceiveStatus::Accepted |
 		protos::LightningReceiveStatus::HtlcsReady => IncomingStatus::Ready,
 		protos::LightningReceiveStatus::Created => IncomingStatus::Pending,
@@ -917,6 +973,7 @@ mod tests {
 				anti_dos_token: None,
 				claim_destination: None,
 				key_index: 1,
+				from_tab: false,
 				progress: Progress::AwaitingPayment,
 			};
 			validate_receive_payment_hash(&receive.invoice, receive.payment_hash).unwrap();

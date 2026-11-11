@@ -1682,7 +1682,12 @@ async fn sign_vtxo_tree(
 	let (mut srv, ark_info) = wallet.require_server().await.context("server not available")?;
 
 	wallet.inner.chain.require_funded_policy().await?;
-	ensure!(vtxo_tree.exit_funding() == Some(ark::exit_policy::paperclip_funding()),
+	// This server's rounds are zero-fee. An older server's rounds are the
+	// 1,000 sat anchor plus 1,000 sat miner fee. Accept either so this wallet
+	// can stay on both. An older wallet still rejects our zero-fee round.
+	let round_funding = vtxo_tree.exit_funding();
+	ensure!(round_funding == Some(ark::exit_policy::paperclip_funding())
+		|| round_funding == Some(ark::exit_policy::legacy_standard_funding()),
 		"round proposal does not fund the required recovery profile");
 	let vtxos_utxo = OutPoint::new(unsigned_round_tx.compute_txid(), ROUND_TX_VTXO_TREE_VOUT);
 

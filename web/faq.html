@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Riptide Ark · FAQ</title><link rel="stylesheet" href="/style.css"></head>
+<body><header><div class="brand"><img class="brand-icon" src="/riptide_icon.png" width="40" height="40" alt="Riptide"><span>RIPTIDE<small>Ark Wallet FAQ</small></span></div>
+<a class="faq-link" href="/">Back to wallet</a></header>
+<main>
+<h1>What to do next</h1>
+<p class="intro">Short answers for boarding and Lightning. Balances live in your wallet data; this page is documentation only.</p>
+<section><h2>Day-one path</h2>
+<ol><li>Deposit on-chain XBT to your deposit address.</li>
+<li>Wait for the ASP confirmation count (often 3).</li>
+<li>Board less than your full balance — fees and recovery reserves are extra.</li>
+<li>After the board confirms, Overview shows an Ark balance.</li></ol></section>
+<section><h2>Boarding tips</h2>
+<p>Board amount is not “balance including fees.” Leave sats behind. While a board is in flight, Overview Mid-flight shows pending board and unconfirmed change — a temporary confirmed 0 does not mean funds vanished.</p></section>
+<section><h2>Lightning receives</h2>
+<p>Creating an invoice does not move funds. State stays <strong>awaiting-payment</strong> until a Blake2b LN payer settles the bolt11 and this wallet finishes the Ark claim. Open invoices are listed on the Lightning tab. Keep the wallet service running.</p>
+<p>If a pay attempt never settles, the ASP CLN hold plugin may be rejecting Blake2b invoice features — that is infra, not a missing UI row.</p></section>
+<section><h2>Safety</h2>
+<p>Experimental software. Backup before funding. Use only amounts you can afford to lose.</p></section>
+</main></body></html>

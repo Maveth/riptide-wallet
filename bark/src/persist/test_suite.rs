@@ -207,6 +207,7 @@ fn send_at_start() -> LightningSend {
 		revocation_key: Some(test_pubkey()),
 		progress: Progress::Start,
 		allow_exit_of_htlcs: false,
+		from_tab: false,
 	}
 }
 

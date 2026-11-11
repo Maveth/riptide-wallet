@@ -238,13 +238,13 @@ async fn execute_pay_command(
 				if comment.is_some() {
 					bail!("comment is not supported for BOLT-12 offers");
 				}
-				wallet.pay_lightning_offer(offer, amount, wait).await?;
+				wallet.pay_lightning_offer(offer, amount, wait, bark::LightningPaySource::Auto).await?;
 			} else if let Ok(lnaddr) = LightningAddress::from_str(&invoice) {
 				let amount = amount.context("amount is required for Lightning addresses")?;
-				wallet.pay_lightning_address(&lnaddr, amount, comment, wait).await?;
+				wallet.pay_lightning_address(&lnaddr, amount, comment, wait, bark::LightningPaySource::Auto).await?;
 			} else if let Ok(lnurl) = LnUrl::from_str(&invoice) {
 				let amount = amount.context("amount is required for LNURL")?;
-				wallet.pay_lnurl(&lnurl, amount, comment, wait).await?;
+				wallet.pay_lnurl(&lnurl, amount, comment, wait, bark::LightningPaySource::Auto).await?;
 			} else {
 				bail!("argument is not a valid BOLT-11 or BOLT-12 invoice, BOLT-12 offer, \
 					Lightning address or LNURL");

@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use server_rpc::protos;
-use ark::{bolt12_receive, ProtocolEncoding};
+use ark::bolt12_receive;
 use ark::lightning::{Invoice, Offer};
 use crate::{Wallet, WalletInner};
 use crate::actions::WalletActionCheckpoint;
-use crate::actions::lightning::receive::{LightningReceive, Progress, ln_recv_action_id};
+use crate::actions::lightning::receive::{LightningReceive, Progress, ln_recv_action_id, register_bolt12_request};
 
 pub(crate) const OFFER_CHECKPOINT: &str = "ln_offer.default";
 
@@ -75,8 +75,16 @@ impl Wallet {
 		let offer = Offer::from_str(&state.offer).map_err(|e| anyhow!("invalid stored offer: {e:?}"))?;
 		let (request, amount_sat) = bolt12_receive::parse_request(bytes, &offer, self.network().await?, relay.maximum_sat)?;
 		let amount = Amount::from_sat(amount_sat);
-		let fee = info.fees.lightning_receive.calculate(amount).context("fee overflow")?;
-		ark::fees::validate_and_subtract_fee(amount, fee)?;
+		let from_tab = amount < ark::lightning::lightning_tab_floor();
+		if from_tab {
+			if self.lightning_tab_opted_out().await? {
+				bail!("small Lightning payments are off. Turn the tab back on to receive under {} sats.",
+					ark::lightning::lightning_tab_floor().to_sat());
+			}
+		} else {
+			let fee = info.fees.lightning_receive.calculate(amount).context("fee overflow")?;
+			ark::fees::validate_and_subtract_fee(amount, fee)?;
+		}
 		let key = self.peek_keypair(state.key_index).await?;
 		let preimage = bolt12_receive::request_preimage(&key, bytes)?;
 		let hash = preimage.compute_payment_hash();
@@ -86,6 +94,7 @@ impl Wallet {
 		let receive = if let Some(existing) = self.lightning_receive_checkpoint(hash).await? {
 			ensure!(matches!(existing.progress, Progress::AwaitingPayment), "request already accepted");
 			ensure!(!existing.invoice.expired_at(std::time::UNIX_EPOCH.elapsed()?), "request expired; request a new invoice");
+			ensure!(existing.from_tab == from_tab, "stored receive does not match the tab floor");
 			existing
 		} else {
 			ensure!(self.pending_lightning_receives().await?.len() < 128, "too many pending receives");
@@ -102,17 +111,14 @@ impl Wallet {
 			let receive = LightningReceive {
 				invoice: Invoice::Bolt12(invoice), payment_hash: hash, payment_preimage: preimage,
 				htlc_recv_cltv_delta: delta, anti_dos_token: None, claim_destination: None,
-				key_index, progress: Progress::AwaitingPayment,
+				key_index, from_tab, progress: Progress::AwaitingPayment,
 			};
 			// Durable before either registration or publication. A timeout or restart
 			// reuses this exact invoice and preimage, never an untracked payment.
 			self.inner.db.upsert_wallet_action_checkpoint(&id, &receive.clone().into()).await?;
 			receive
 		};
-		let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(self.inner.seed.to_mailbox_keypair().public_key());
-		srv.client.register_bolt12_receive(protos::RegisterBolt12ReceiveRequest {
-			invoice: receive.invoice.to_string(), min_cltv_delta: receive.htlc_recv_cltv_delta.into(), mailbox_id: Some(mailbox.serialize()),
-		}).await?;
+		srv.client.register_bolt12_receive(register_bolt12_request(self, &receive)).await?;
 		Ok(receive.invoice.to_string())
 	}
 

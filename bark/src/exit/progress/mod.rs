@@ -4,7 +4,7 @@ pub(crate) mod util;
 use std::collections::HashSet;
 
 use bitcoin::Txid;
-use log::debug;
+use log::{debug, warn};
 
 use bitcoin_ext::{BlockHeight, BlockRef, TxStatus};
 
@@ -166,8 +166,14 @@ impl<'a> ProgressContext<'a> {
 						for input in &tx.input {
 							if !self.check_confirmed(input.previous_output.txid).await { ready = false; }
 						}
-						if ready && self.wallet.inner.chain.broadcast_tx(&tx).await.is_ok() {
-							return Ok(ExitTxStatus::AwaitingParentConfirmation);
+						if ready {
+							match self.wallet.inner.chain.broadcast_tx(&tx).await {
+								Ok(()) => return Ok(ExitTxStatus::AwaitingParentConfirmation),
+								Err(error) => warn!(
+									"Exit tx {} did not relay ({:#}); attaching a child payment",
+									exit.txid, error,
+								),
+							}
 						}
 					}
 					Ok(ExitTxStatus::AwaitingCpfpBroadcast)

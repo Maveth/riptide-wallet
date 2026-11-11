@@ -706,6 +706,7 @@ impl LightningSendInfo {
 					SendProgress::Start => "start",
 					SendProgress::HtlcReceived(_) => "htlc-received",
 					SendProgress::PaymentInitiated(_) => "payment-initiated",
+					SendProgress::TabPending => "tab-pending",
 					SendProgress::RevocableHtlcs { .. } => "revocable-htlcs",
 					SendProgress::RevocationStuck { .. } => "revocation-stuck",
 					SendProgress::AwaitingReimbursement { .. } => "awaiting-reimbursement",

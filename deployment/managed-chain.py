@@ -85,6 +85,7 @@ def adapter_args(root=ROOT, lib=LIB):
 def supervise():
     os.umask(0o077)
     # Allows the explicit adapter handshake. Native txindex remains supported.
+    # The pruned adapter is the process that implements paperclipregistertransactions.
     os.environ['PAPERCLIP_PRUNED_RPC'] = '1'
     os.environ['PAPERCLIP_PLATFORM_CONNECTION'] = str(ROOT / 'platform-wallet.json')
     stopped = False
@@ -128,6 +129,10 @@ def supervise():
                     except Exception:
                         ready = False
                 if ready:
+                    if uses_adapter:
+                        os.environ['PAPERCLIP_PRUNED_RPC'] = '1'
+                    else:
+                        os.environ.pop('PAPERCLIP_PRUNED_RPC', None)
                     wallet = subprocess.Popen(['python3', str(LIB / 'entrypoint.py')], stdin=subprocess.DEVNULL)
                 else:
                     time.sleep(2)

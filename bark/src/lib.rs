@@ -419,6 +419,7 @@ pub use self::config::{
 };
 pub use self::daemon::{tip_watcher, DaemonHandle};
 pub use self::fees::FeeEstimate;
+pub use self::lightning::tab::LightningPaySource;
 pub use self::import::{ImportVtxoArgs, ImportVtxoError};
 pub use self::notification::{WalletNotification, NotificationStream};
 pub use self::recovery::{RecoveryReport, RecoveryReportEntry, RecoveryStatus};
@@ -1662,6 +1663,9 @@ impl Wallet {
 
 	/// Fetches all wallet fund movements ordered from newest to oldest.
 	pub async fn history(&self) -> anyhow::Result<Vec<Movement>> {
+		if let Err(err) = crate::actions::lightning::pay::repair_settled_tab_sends(self).await {
+			log::warn!("could not fill a settled tab payment amount: {:#}", err);
+		}
 		Ok(self.inner.db.get_all_movements().await?)
 	}
 

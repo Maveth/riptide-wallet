@@ -181,6 +181,27 @@ impl Wallet {
 		Ok(invoice)
 	}
 
+	/// Same as [`Self::pay_lightning_invoice`] with an explicit tab or coin choice.
+	pub async fn pay_lightning_invoice_sourced<T>(
+		&self,
+		invoice: T,
+		user_amount: Option<Amount>,
+		wait: bool,
+		source: crate::LightningPaySource,
+	) -> anyhow::Result<Invoice>
+	where
+		T: TryInto<Invoice>,
+		T::Error: std::error::Error + fmt::Display + Send + Sync + 'static,
+	{
+		let invoice = invoice.try_into().context("failed to parse invoice")?;
+		let amount = invoice.get_payment_amount(user_amount)?;
+		info!("Sending Lightning payment of {} to invoice {}", amount, invoice);
+		self.make_lightning_payment_sourced(
+			&invoice, invoice.clone().into(), user_amount, wait, source,
+		).await?;
+		Ok(invoice)
+	}
+
 	/// Same as [`Self::pay_lightning_invoice`] but resolves the invoice
 	/// from a [`LightningAddress`] first.
 	pub async fn pay_lightning_address(
@@ -189,12 +210,15 @@ impl Wallet {
 		amount: Amount,
 		comment: Option<impl AsRef<str>>,
 		wait: bool,
+		source: crate::LightningPaySource,
 	) -> anyhow::Result<Invoice> {
 		let comment = comment.as_ref();
 		let invoice: Invoice = lnaddr_invoice(addr, amount, comment).await
 			.context("lightning address error")?.into();
 		info!("Sending {} to lightning address {}", amount, addr);
-		self.make_lightning_payment(&invoice, addr.clone().into(), None, wait).await?;
+		self.make_lightning_payment_sourced(
+			&invoice, addr.clone().into(), None, wait, source,
+		).await?;
 		info!("Paid invoice {}", invoice);
 		Ok(invoice)
 	}
@@ -209,11 +233,14 @@ impl Wallet {
 		amount: Amount,
 		comment: Option<impl AsRef<str>>,
 		wait: bool,
+		source: crate::LightningPaySource,
 	) -> anyhow::Result<Invoice> {
 		let invoice: Invoice = lnurlp_invoice(&lnurl.url, amount, comment).await
 			.context("lnurl-pay error")?.into();
 		info!("Sending {} to lnurl {}", amount, lnurl);
-		self.make_lightning_payment(&invoice, lnurl.clone().into(), None, wait).await?;
+		self.make_lightning_payment_sourced(
+			&invoice, lnurl.clone().into(), None, wait, source,
+		).await?;
 		info!("Paid invoice {}", invoice);
 		Ok(invoice)
 	}
@@ -224,6 +251,7 @@ impl Wallet {
 		offer: Offer,
 		user_amount: Option<Amount>,
 		wait: bool,
+		source: crate::LightningPaySource,
 	) -> anyhow::Result<Invoice> {
 		let (mut srv, _) = self.require_server().await?;
 
@@ -258,7 +286,9 @@ impl Wallet {
 			.context("invalid BOLT12 invoice received from offer")?;
 
 		let invoice: Invoice = invoice.into();
-		self.make_lightning_payment(&invoice, offer.into(), Some(amount), wait).await?;
+		self.make_lightning_payment_sourced(
+			&invoice, offer.into(), Some(amount), wait, source,
+		).await?;
 		info!("Paid invoice: {}", invoice);
 		Ok(invoice)
 	}
@@ -271,6 +301,19 @@ impl Wallet {
 		original_payment_method: PaymentMethod,
 		user_amount: Option<Amount>,
 		wait: bool,
+	) -> anyhow::Result<()> {
+		self.make_lightning_payment_sourced(
+			invoice, original_payment_method, user_amount, wait, crate::LightningPaySource::Auto,
+		).await
+	}
+
+	pub async fn make_lightning_payment_sourced(
+		&self,
+		invoice: &Invoice,
+		original_payment_method: PaymentMethod,
+		user_amount: Option<Amount>,
+		wait: bool,
+		source: crate::LightningPaySource,
 	) -> anyhow::Result<()> {
 		if !original_payment_method.is_lightning() && !original_payment_method.is_custom() {
 			bail!("Invalid original payment method for lightning payment");
@@ -292,7 +335,7 @@ impl Wallet {
 			Some(existing) => existing,
 			None => {
 				let start = start_lightning_send(
-					self, invoice.clone(), user_amount, original_payment_method,
+					self, invoice.clone(), user_amount, original_payment_method, source,
 				).await?;
 
 				self.inner.db.upsert_wallet_action_checkpoint(

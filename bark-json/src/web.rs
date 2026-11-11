@@ -74,6 +74,18 @@ pub struct FeeEstimateQuery {
 	pub amount_sat: u64,
 }
 
+/// Query for a Lightning send quote. An invoice lets the server price a public route.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+pub struct LightningSendFeeQuery {
+	/// The amount in satoshis. Optional when `invoice` carries an amount.
+	pub amount_sat: Option<u64>,
+	/// A BOLT11 or BOLT12 invoice. Unparseable values are ignored and the schedule is used.
+	pub invoice: Option<String>,
+	/// `auto`, `tab`, or `coin`. Omitted means `auto`.
+	pub source: Option<String>,
+}
+
 /// Query parameters for send-onchain fee estimates.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -122,6 +134,19 @@ pub struct FeeEstimateResponse {
 	/// The VTXOs that would be spent for this operation
 	#[cfg_attr(feature = "utoipa", schema(value_type = Vec<String>))]
 	pub vtxos_spent: Vec<VtxoId>,
+	/// True when a sub-dust invoice is charged to the 1,000 sat Lightning tab.
+	#[serde(default)]
+	pub from_tab: bool,
+	/// True when the amount cannot be an Ark coin, so the tab is the only path.
+	#[serde(default)]
+	pub tab_required: bool,
+	/// False when the route could not be priced. The fee is a hold, not the final charge.
+	#[serde(default = "route_was_priced")]
+	pub route_priced: bool,
+}
+
+fn route_was_priced() -> bool {
+	true
 }
 
 impl From<bark::FeeEstimate> for FeeEstimateResponse {
@@ -131,6 +156,9 @@ impl From<bark::FeeEstimate> for FeeEstimateResponse {
 			fee: estimate.fee,
 			net_amount: estimate.net_amount,
 			vtxos_spent: estimate.vtxos_spent,
+			from_tab: estimate.from_tab,
+			tab_required: estimate.tab_required,
+			route_priced: estimate.route_priced,
 		}
 	}
 }
@@ -612,6 +640,9 @@ pub struct LightningPayRequest {
 	pub amount_sat: Option<u64>,
 	/// An optional comment, only supported when paying to lightning addresses
 	pub comment: Option<String>,
+	/// `auto`, `tab`, or `coin`. Omitted means `auto`: under the dust floor uses the tab.
+	#[serde(default)]
+	pub source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

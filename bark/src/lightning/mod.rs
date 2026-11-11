@@ -1,6 +1,7 @@
 
 mod pay;
 mod receive;
+pub(crate) mod tab;
 pub mod offers;
 
 use anyhow::Context;

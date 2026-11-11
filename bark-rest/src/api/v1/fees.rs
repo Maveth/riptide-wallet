@@ -27,6 +27,7 @@ use crate::error::{self, HandlerResult, ContextExt, badarg};
 		bark_json::web::ArkSendEstimateRequest,
 		bark_json::web::ArkSendEstimateResponse,
 		bark_json::web::FeeEstimateQuery,
+		bark_json::web::LightningSendFeeQuery,
 		bark_json::web::SendOnchainFeeEstimateQuery,
 		bark_json::web::OffboardAllFeeEstimateQuery,
 		bark_json::web::OffboardFeeEstimateRequest,
@@ -237,7 +238,8 @@ pub async fn offboard_fee(
 	path = "/lightning/pay",
 	summary = "Estimate Lightning send fee",
 	params(
-		("amount_sat" = u64, Query, description = "The amount in satoshis to send over Lightning"),
+		("amount_sat" = Option<u64>, Query, description = "The amount in satoshis to send over Lightning"),
+		("invoice" = Option<String>, Query, description = "Optional BOLT11 or BOLT12 invoice used to price a route"),
 	),
 	responses(
 		(status = 200, description = "Returns the fee estimate", body = bark_json::web::FeeEstimateResponse),
@@ -253,13 +255,26 @@ pub async fn offboard_fee(
 #[debug_handler]
 pub async fn lightning_send_fee(
 	State(state): State<Arc<ServerState>>,
-	Query(query): Query<bark_json::web::FeeEstimateQuery>,
+	Query(query): Query<bark_json::web::LightningSendFeeQuery>,
 ) -> HandlerResult<Json<bark_json::web::FeeEstimateResponse>> {
 	let wallet = state.require_wallet()?;
 
-	let amount = Amount::from_sat(query.amount_sat);
-	let estimate = wallet.estimate_lightning_send_fee(amount).await
-		.context("Failed to estimate lightning send fee")?;
+	let invoice = query.invoice.as_deref().map(str::trim).filter(|raw| !raw.is_empty())
+		.and_then(|raw| raw.parse::<ark::lightning::Invoice>().ok());
+	let user_amount = match query.amount_sat {
+		Some(0) => badarg!("amount must be positive"),
+		Some(amount) => Some(Amount::from_sat(amount)),
+		None => None,
+	};
+	let source = bark::LightningPaySource::parse(query.source.as_deref())
+		.badarg("payment source must be auto, tab, or coin")?;
+	let estimate = if let Some(invoice) = invoice {
+		wallet.estimate_lightning_invoice_fee_sourced(&invoice, user_amount, source).await
+	} else if let Some(amount) = user_amount {
+		wallet.estimate_lightning_send_fee(amount).await
+	} else {
+		badarg!("Enter an amount or paste an invoice that includes one.")
+	}.context("Failed to estimate lightning send fee")?;
 
 	Ok(axum::Json(estimate.into()))
 }

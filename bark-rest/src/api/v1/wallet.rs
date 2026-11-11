@@ -769,13 +769,13 @@ pub async fn send(
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-12 offers");
 		}
-		wallet.pay_lightning_offer(offer, amount, false).await?
+		wallet.pay_lightning_offer(offer, amount, false, bark::LightningPaySource::Auto).await?
 	} else if let Ok(addr) = LightningAddress::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&addr, amount, body.comment, false).await?
+		wallet.pay_lightning_address(&addr, amount, body.comment, false, bark::LightningPaySource::Auto).await?
 	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for LNURL")?;
-		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
+		wallet.pay_lnurl(&lnurl, amount, body.comment, false, bark::LightningPaySource::Auto).await?
 	} else if let Ok(addr) = bitcoin::Address::from_str(&body.destination) {
 		let _checked_addr = addr
 			.require_network(wallet.network().await?)

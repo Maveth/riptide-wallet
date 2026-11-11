@@ -43,3 +43,17 @@ body{background:radial-gradient(ellipse at 85% 0%,#f568350a,transparent 48%),#11
 #message-proof:not([hidden]){animation:message-reveal .2s ease-out}
 @keyframes message-reveal{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
 @media(prefers-reduced-motion:reduce){#message-proof:not([hidden]){animation:none}}
+
+.metrics{grid-template-columns:1fr 1fr 1fr}
+@media(max-width:900px){.metrics{grid-template-columns:1fr}}
+.tab-card{border:1px solid #243049;border-left:3px solid #f0c674;border-radius:16px;background:linear-gradient(145deg,#182338,#121a2b);padding:18px;margin-bottom:28px}
+.tab-opt{display:flex;align-items:center;gap:10px;font-size:14px;color:#eef2f8}
+.tab-balance{display:flex;flex-direction:column;align-items:flex-start;width:100%;margin:14px 0;padding:16px 18px;border:1px solid #3a4d6a;border-radius:14px;background:#0e1624;color:#eef2f8;text-align:left;cursor:default}
+.tab-balance span,.tab-balance small{color:#8b9bb8;font-size:13px}
+.tab-balance strong{font-size:36px;letter-spacing:-1px;margin:6px 0 2px;font-variant-numeric:tabular-nums}
+.tab-actions{display:flex;flex-wrap:wrap;gap:10px}
+.tab-actions button{flex:1;min-width:180px}
+.tab-note{margin-top:14px}
+.tab-note summary{cursor:pointer;color:#8b9bb8}
+.tab-card.opted-out #ln-tab-body{display:none}
+.tab-balance:disabled{opacity:1;filter:none;color:#eef2f8;transform:none;box-shadow:none}

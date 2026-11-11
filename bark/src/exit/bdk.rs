@@ -46,14 +46,9 @@ impl Exit {
 		};
 
 		for req in self.exits_needing_cpfp().await {
-			if let Some(vtxo) = wallet.inner.db.get_full_vtxo(req.vtxo_id).await? {
-				let required = fee_rate.to_sat_per_kwu().checked_mul(req.exit_tx.weight().to_wu())
-					.and_then(|v| v.checked_add(999)).map(|v| bitcoin::Amount::from_sat(v / 1000));
-				if vtxo.has_funded_exit() && required.is_some_and(|required|
-					vtxo.exit_transaction_fee(req.exit_tx.compute_txid()).is_some_and(|fee| fee >= required)) {
-					continue;
-				}
-			}
+			// A recorded exit fee can look large enough while the node still
+			// rejects the transaction alone. AwaitingCpfpBroadcast means it is
+			// not in the mempool, so attach a child payment from the on-chain wallet.
 			let fees = match req.rbf_requirement {
 				None => MakeCpfpFees::Effective(fee_rate),
 				Some(rbf) => {

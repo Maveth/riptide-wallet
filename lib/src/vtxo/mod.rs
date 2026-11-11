@@ -640,6 +640,15 @@ impl<P: Policy> Vtxo<Full, P> {
 			.expect("genesis item count fits in u16")
 	}
 
+	/// True when every hop is the version-3 zero-fee anchor exit.
+	pub fn has_zero_fee_exit(&self) -> bool {
+		!self.genesis.items.is_empty() && self.genesis.items.iter().all(|item| {
+			item.exit_format == bitcoin_ext::fee::ExitFormat::LegacyV3
+				&& item.miner_fee == Amount::ZERO
+				&& item.fee_amount == Amount::ZERO
+		})
+	}
+
 	/// Iterate over all oor transitions in this VTXO
 	///
 	/// The outer `Vec` cointains one element for each transition.
@@ -811,6 +820,19 @@ impl<P: Policy> Vtxo<Full, P> {
 	/// Every ancestor must pay its own fee; an empty path is not funded.
 	pub fn has_funded_exit(&self) -> bool {
 		!self.genesis.items.is_empty() && self.genesis.items.iter().all(|i| i.miner_fee > Amount::ZERO)
+	}
+
+	/// The chain can be spent with this recovery profile and no other.
+	pub fn matches_exit_funding(&self, funding: crate::tree::signed::TreeExitFunding) -> bool {
+		let items = &self.genesis.items;
+		if items.is_empty() {
+			return false;
+		}
+		items.iter().all(|item| {
+			item.exit_format == funding.format()
+				&& item.miner_fee == funding.miner_fee()
+				&& item.fee_amount == funding.anchor()
+		})
 	}
 
 	/// Serialize the genesis chain into a fresh `Vec<u8>`.

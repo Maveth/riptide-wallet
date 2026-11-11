@@ -52,6 +52,10 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/receives", get(list_receive_statuses))
 		.route("/sends/{identifier}", get(get_send_status))
 		.route("/pay", post(pay))
+		.route("/tab", get(lightning_tab))
+		.route("/tab/fund", post(fund_lightning_tab))
+		.route("/tab/return", post(return_lightning_tab))
+		.route("/tab/opt", post(set_lightning_tab_opt))
 }
 
 #[utoipa::path(
@@ -294,23 +298,25 @@ pub async fn pay(
 	let wallet = state.require_wallet()?;
 
 	let amount = body.amount_sat.map(|a| Amount::from_sat(a));
+	let source = bark::LightningPaySource::parse(body.source.as_deref())
+		.badarg("payment source must be auto, tab, or coin")?;
 
 	let invoice = if let Ok(invoice) = Invoice::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for Lightning invoices");
 		}
-		wallet.pay_lightning_invoice(invoice, amount, false).await?
+		wallet.pay_lightning_invoice_sourced(invoice, amount, false, source).await?
 	} else if let Ok(offer) = Offer::from_str(&body.destination) {
 		if body.comment.is_some() {
 			badarg!("comment is not supported for BOLT-12 offers");
 		}
-		wallet.pay_lightning_offer(offer, amount, false).await?
+		wallet.pay_lightning_offer(offer, amount, false, source).await?
 	} else if let Ok(lnaddr) = LightningAddress::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for Lightning addresses")?;
-		wallet.pay_lightning_address(&lnaddr, amount, body.comment, false).await?
+		wallet.pay_lightning_address(&lnaddr, amount, body.comment, false, source).await?
 	} else if let Ok(lnurl) = LnUrl::from_str(&body.destination) {
 		let amount = amount.badarg("amount is required for LNURL")?;
-		wallet.pay_lnurl(&lnurl, amount, body.comment, false).await?
+		wallet.pay_lnurl(&lnurl, amount, body.comment, false, source).await?
 	} else {
 		badarg!("argument is not a valid BOLT-11 or BOLT-12 invoice, BOLT-12 offer, Lightning address or LNURL");
 	};
@@ -343,4 +349,58 @@ pub async fn get_offer(State(state): State<Arc<ServerState>>) -> HandlerResult<J
 pub async fn disable_offer(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
 	state.require_wallet()?.disable_lightning_offer().await?;
 	Ok(Json(serde_json::json!({"active": false})))
+}
+
+#[debug_handler]
+pub async fn lightning_tab(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let (balance, opted_out) = wallet.lightning_tab_view().await
+		.context("Failed to read the Lightning tab")?;
+	Ok(Json(serde_json::json!({
+		"balance_sat": balance.to_sat(),
+		"chunk_sat": bark::Wallet::lightning_tab_chunk().to_sat(),
+		"opted_out": opted_out,
+	})))
+}
+
+#[derive(serde::Deserialize)]
+pub struct LightningTabOpt {
+	pub opted_out: bool,
+}
+
+#[debug_handler]
+pub async fn set_lightning_tab_opt(
+	State(state): State<Arc<ServerState>>,
+	Json(body): Json<LightningTabOpt>,
+) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let balance = wallet.set_lightning_tab_opt_out(body.opted_out).await
+		.context("Failed to set the Lightning tab opt-out")?;
+	Ok(Json(serde_json::json!({
+		"balance_sat": balance.to_sat(),
+		"chunk_sat": bark::Wallet::lightning_tab_chunk().to_sat(),
+		"opted_out": body.opted_out,
+	})))
+}
+
+#[debug_handler]
+pub async fn return_lightning_tab(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let amount = wallet.withdraw_lightning_tab().await.context("Failed to move the tab back into a coin")?;
+	let balance = wallet.lightning_tab_balance().await.context("Failed to read the Lightning tab")?;
+	Ok(Json(serde_json::json!({
+		"amount_sat": amount.to_sat(),
+		"balance_sat": balance.to_sat(),
+		"chunk_sat": bark::Wallet::lightning_tab_chunk().to_sat(),
+	})))
+}
+
+#[debug_handler]
+pub async fn fund_lightning_tab(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let balance = wallet.fund_lightning_tab().await.context("Failed to fund the Lightning tab")?;
+	Ok(Json(serde_json::json!({
+		"balance_sat": balance.to_sat(),
+		"chunk_sat": bark::Wallet::lightning_tab_chunk().to_sat(),
+	})))
 }

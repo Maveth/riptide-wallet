@@ -5,6 +5,8 @@ use bitcoin::Amount;
 
 use ark::{Vtxo, VtxoId};
 use ark::fees::VtxoFeeInfo;
+use ark::lightning::Invoice;
+use server_rpc::protos;
 
 use crate::Wallet;
 use crate::vtxo::selection::InputSelection;
@@ -23,6 +25,13 @@ pub struct FeeEstimate {
 	pub net_amount: Amount,
 	/// The VTXOs that would be used for this operation, if necessary.
 	pub vtxos_spent: Vec<VtxoId>,
+	/// The payment is under the dust floor and is charged to the Lightning tab.
+	pub from_tab: bool,
+	/// The invoice is under the dust floor, so an Ark coin cannot pay it.
+	pub tab_required: bool,
+	/// False when the server could not price the route. The fee is then a hold
+	/// at the schedule. A tab payment keeps the real route cost plus 1 sat.
+	pub route_priced: bool,
 }
 
 impl FeeEstimate {
@@ -37,7 +46,15 @@ impl FeeEstimate {
 			fee,
 			net_amount,
 			vtxos_spent,
+			from_tab: false,
+			tab_required: false,
+			route_priced: true,
 		}
+	}
+
+	pub fn tab(mut self) -> Self {
+		self.from_tab = true;
+		self
 	}
 }
 
@@ -126,12 +143,78 @@ impl Wallet {
 	/// Uses the same builder-validated input selection as the actual send. Errors
 	/// are propagated rather than replaced by a hypothetical fee for an unbuildable payment.
 	pub async fn estimate_lightning_send_fee(&self, amount: Amount) -> anyhow::Result<FeeEstimate> {
+		self.estimate_lightning_send_with_service_fee(amount, None).await
+	}
+
+	/// Quote from the invoice when the server can price a public route.
+	/// Otherwise the estimate uses the fee schedule.
+	pub async fn estimate_lightning_invoice_fee(
+		&self, invoice: &Invoice, user_amount: Option<Amount>,
+	) -> anyhow::Result<FeeEstimate> {
+		self.estimate_lightning_invoice_fee_sourced(
+			invoice, user_amount, crate::LightningPaySource::Auto,
+		).await
+	}
+
+	pub async fn estimate_lightning_invoice_fee_sourced(
+		&self, invoice: &Invoice, user_amount: Option<Amount>, source: crate::LightningPaySource,
+	) -> anyhow::Result<FeeEstimate> {
+		let amount = invoice.get_payment_amount(user_amount)?;
+		let under_floor = amount < ark::lightning::lightning_tab_floor();
+		let use_tab = match source {
+			crate::LightningPaySource::Tab => true,
+			crate::LightningPaySource::Coin => {
+				ensure!(!under_floor, "an invoice under {} sats cannot be an Ark coin. Top up the tab once, then pay from the tab.",
+					ark::lightning::lightning_tab_floor().to_sat());
+				false
+			},
+			crate::LightningPaySource::Auto => under_floor,
+		};
+		if use_tab {
+			let quoted = self.lightning_service_fee_quote(invoice, amount).await?;
+			let (_, info) = self.require_server().await?;
+			let fee = match quoted {
+				Some(fee) => fee,
+				None => info.fees.lightning_send.calculate(amount, std::iter::empty())
+					.context("Lightning tab fee overflow")?,
+			};
+			let total = amount.checked_add(fee).context("Lightning tab total overflow")?;
+			let mut estimate = FeeEstimate::new(total, fee, amount, vec![]).tab();
+			estimate.tab_required = under_floor;
+			estimate.route_priced = quoted.is_some();
+			return Ok(estimate);
+		}
+		let service_fee = self.lightning_service_fee_quote(invoice, amount).await?;
+		self.estimate_lightning_send_with_service_fee(amount, service_fee).await
+	}
+
+	/// `Some` is the route cost plus 1 sat. `None` means the schedule applies.
+	pub async fn lightning_service_fee_quote(
+		&self, invoice: &Invoice, amount: Amount,
+	) -> anyhow::Result<Option<Amount>> {
+		let (mut srv, _) = self.require_server().await?;
+		let resp = srv.client.quote_lightning_send(protos::QuoteLightningSendRequest {
+			invoice: invoice.to_string(),
+			amount_sat: amount.to_sat(),
+		}).await.context("Lightning route quote failed")?.into_inner();
+		if resp.route_found {
+			Ok(Some(Amount::from_sat(resp.user_fee_sat)))
+		} else {
+			Ok(None)
+		}
+	}
+
+	async fn estimate_lightning_send_with_service_fee(
+		&self, amount: Amount, service_fee: Option<Amount>,
+	) -> anyhow::Result<FeeEstimate> {
 		let (_, info) = self.require_server().await?;
 		let tip = self.inner.chain.tip().await?;
 		let (key, _) = self.peek_next_keypair().await?;
 		let policy = ark::VtxoPolicy::new_server_htlc_send(key.public_key(),
 			ark::lightning::PaymentHash::from_byte_array([0; 32]), tip + info.htlc_send_expiry_delta);
-		let (inputs, fee, reserve) = self.plan_lightning_payment(amount, policy, key.public_key()).await?;
+		let (inputs, fee, reserve) = self.plan_lightning_payment(
+			amount, policy, key.public_key(), service_fee,
+		).await?;
 		let fee = fee.checked_add(reserve).context("Lightning fee overflow")?;
 		let total = amount.checked_add(fee).context("payment amount overflow")?;
 		Ok(FeeEstimate::new(total, fee, amount, inputs.iter().map(|v| v.id()).collect()))

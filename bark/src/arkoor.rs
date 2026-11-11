@@ -24,6 +24,36 @@ pub struct ArkoorCreateResult {
 	pub change: Vec<Vtxo<Full>>,
 }
 
+/// Pick the recovery profile the input chain already uses.
+///
+/// The order is the update path. Zero-fee first, then the older 1,000 plus
+/// 1,000 coin, then the two small-anchor budgets when the server allows them.
+/// A chain that mixes profiles cannot be spent. Upgrading this wallet does
+/// not retarget an old coin onto the zero-fee shape.
+fn recovery_funding_for_inputs(
+	inputs: &[Vtxo<Full>],
+	allow_small_anchor: bool,
+	allow_economical: bool,
+) -> Result<ark::tree::signed::TreeExitFunding, ArkoorConstructionError> {
+	let mut profiles = vec![
+		ark::exit_policy::paperclip_funding(),
+		ark::exit_policy::legacy_standard_funding(),
+	];
+	if allow_small_anchor {
+		profiles.push(ark::exit_policy::small_anchor_transfer_funding());
+		profiles.push(ark::exit_policy::legacy_small_anchor_funding());
+	}
+	if allow_economical {
+		profiles.push(ark::exit_policy::economical_transfer_funding());
+	}
+	if let Some(funding) = profiles.into_iter().find(|funding| {
+		!inputs.is_empty() && inputs.iter().all(|vtxo| vtxo.matches_exit_funding(*funding))
+	}) {
+		return Ok(funding);
+	}
+	Err(ArkoorConstructionError::IncompatibleExitFunding)
+}
+
 /// Error returned by [`Wallet::create_checkpointed_arkoor_with_vtxos`].
 ///
 /// The cosign RPC failure is kept as a typed [`tonic::Status`] rather
@@ -267,12 +297,18 @@ impl Wallet {
 		// The profile fixes the output allocation. Older split-piece hints cannot
 		// change recipient amounts or create dust recovery outputs.
 		let _ = change_pieces;
-		let funding = if economical_transfer { ark::exit_policy::economical_transfer_funding() }
-			else if small_anchor_transfer { ark::exit_policy::small_anchor_transfer_funding() }
-			else { ark::exit_policy::paperclip_funding() };
-		let (builder, recovery_reserve) = ArkoorPackageBuilder::new_funded_payment_with_funding(
-			inputs, arkoor_dest.clone(), VtxoPolicy::new_pubkey(change_pubkey), funding,
-		).context("insufficient funded recovery reserves; refresh or select more inputs")?;
+		let funding = recovery_funding_for_inputs(&inputs, small_anchor_transfer, economical_transfer)
+			.map_err(anyhow::Error::from)
+			.context("this coin's recovery chain cannot fund the payment")?;
+		let (builder, recovery_reserve) = (if funding == ark::exit_policy::paperclip_funding() {
+			ArkoorPackageBuilder::new_funded_payment(
+				inputs, arkoor_dest.clone(), VtxoPolicy::new_pubkey(change_pubkey),
+			)
+		} else {
+			ArkoorPackageBuilder::new_funded_payment_with_funding(
+				inputs, arkoor_dest.clone(), VtxoPolicy::new_pubkey(change_pubkey), funding,
+			)
+		}).context("insufficient funded recovery reserves; refresh or select more inputs")?;
 		let builder = builder.generate_user_nonces(&user_keypairs)
 			.context("invalid nb of keypairs")?;
 
@@ -344,9 +380,6 @@ impl Wallet {
 		let (_, info) = self.require_server().await?;
 		let small_anchor_transfer = info.small_anchor_transfers;
 		let economical_transfer = info.economical_transfers;
-		let funding = if economical_transfer { ark::exit_policy::economical_transfer_funding() }
-			else if small_anchor_transfer { ark::exit_policy::small_anchor_transfer_funding() }
-			else { ark::exit_policy::paperclip_funding() };
 		ensure!(amount > Amount::ZERO, "payment amount must be positive");
 		let tip = self.inner.chain.tip().await?;
 		let candidates = self.spendable_vtxos().await?;
@@ -358,10 +391,17 @@ impl Wallet {
 		let (inputs, recovery_reserve) = selection.select_ark_constructible(candidates, |inputs| {
 			let hydrated = inputs.iter().map(|v| full.get(&v.id()).cloned()
 				.context("Missing Ark input ancestry")).collect::<anyhow::Result<Vec<_>>>()?;
-			match ArkoorPackageBuilder::new_funded_payment_with_funding(hydrated,
-				ArkoorDestination { total_amount: amount, policy: policy.clone() },
-				VtxoPolicy::new_pubkey(change), funding,
-			) {
+			let funding = recovery_funding_for_inputs(&hydrated, small_anchor_transfer, economical_transfer)?;
+			let built = if funding == ark::exit_policy::paperclip_funding() {
+				ArkoorPackageBuilder::new_funded_payment(hydrated,
+					ArkoorDestination { total_amount: amount, policy: policy.clone() },
+					VtxoPolicy::new_pubkey(change))
+			} else {
+				ArkoorPackageBuilder::new_funded_payment_with_funding(hydrated,
+					ArkoorDestination { total_amount: amount, policy: policy.clone() },
+					VtxoPolicy::new_pubkey(change), funding)
+			};
+			match built {
 				Ok((_, reserve)) => Ok(Some(reserve)),
 				Err(ArkoorConstructionError::Dust | ArkoorConstructionError::Unbalanced { .. }) => Ok(None),
 				Err(error) => Err(error.into()),

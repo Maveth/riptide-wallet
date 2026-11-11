@@ -183,7 +183,7 @@ impl ChainSource {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
 				let info: serde_json::Value = rpc.call_raw("getmempoolinfo", &[]).await?;
-				for (field, ceiling) in [("minrelaytxfee", 0.00001000), ("mempoolminfee", 0.00001000), ("dustrelayfee", 0.00003000)] {
+				for (field, ceiling) in [("minrelaytxfee", 0.00001000), ("mempoolminfee", 0.00001000), ("dustrelayfee", 0.00030000)] {
 					let value = info[field].as_f64().context("backend omits relay policy")?;
 					ensure!(value >= 0.0 && value <= ceiling, "backend {} exceeds the funded profile; refusing new positions", field);
 				}
@@ -703,6 +703,15 @@ impl ChainSource {
 		match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
+				// NOTE: revert this branch to submitpackage once Knots
+				// submitpackage accepts ignore_rejects and keeps that list
+				// through SingleInPackageAccept. Today submitpackage drops
+				// the list, so a strict node rejects this zero-fee parent.
+				if txs.len() == 2 && is_zero_fee_anchor_parent(txs[0].borrow()) {
+					return self.broadcast_zero_fee_exit_pair(
+						rpc, txs[0].borrow(), txs[1].borrow(),
+					).await;
+				}
 				let hexes: Vec<String> = txs.iter()
 					.map(|t| bitcoin::consensus::encode::serialize_hex(t.borrow()))
 					.collect();
@@ -863,6 +872,63 @@ impl ChainSource {
 			*self.fee_rates_fetched_at.write().await = Some(Instant::now());
 		}
 		Ok(())
+	}
+}
+
+fn is_zero_fee_anchor_parent(tx: &Transaction) -> bool {
+	tx.version.0 == 3 && tx.output.iter().filter(|output| {
+		output.value == Amount::ZERO
+			&& output.script_pubkey.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
+	}).count() == 1
+}
+
+fn already_known_tx(err: &str) -> bool {
+	let err = err.to_ascii_lowercase();
+	err.contains("txn-already-known")
+		|| err.contains("already in mempool")
+		|| err.contains("already known")
+}
+
+impl ChainSource {
+	/// Parent then child via sendrawtransaction.
+	///
+	/// Temporary. Replace with submitpackage when that RPC can take
+	/// ignore_rejects and actually apply them to each transaction in the
+	/// package. Until then the parent is sent with the fee and dust reasons
+	/// ignored, and the child is a normal submission once the parent is in.
+	#[cfg(feature = "bitcoind-rpc")]
+	async fn broadcast_zero_fee_exit_pair(
+		&self,
+		rpc: &BitcoindClient,
+		parent: &Transaction,
+		child: &Transaction,
+	) -> Result<(), BroadcastError> {
+		let parent_hex = bitcoin::consensus::encode::serialize_hex(parent);
+		let ignore = serde_json::json!([
+			"min relay fee not met",
+			"dust-nonanchor",
+			"dust-nonzero",
+			"dust",
+		]);
+		match rpc.call_raw::<serde_json::Value>("sendrawtransaction", &[
+			parent_hex.into(),
+			serde_json::json!(0),
+			serde_json::json!(0),
+			ignore,
+		]).await {
+			Ok(_) => {},
+			Err(err) if already_known_tx(&err.to_string()) => {},
+			Err(err) => return Err(BroadcastError::Other(err.to_string())),
+		}
+		let child_hex = bitcoin::consensus::encode::serialize_hex(child);
+		match rpc.call_raw::<serde_json::Value>("sendrawtransaction", &[
+			child_hex.into(),
+			serde_json::json!(0),
+		]).await {
+			Ok(_) => Ok(()),
+			Err(err) if already_known_tx(&err.to_string()) => Ok(()),
+			Err(err) => Err(BroadcastError::Other(err.to_string())),
+		}
 	}
 }
 

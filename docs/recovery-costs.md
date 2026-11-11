@@ -59,6 +59,16 @@ Show recipient amount, service fee, recovery allocation, total debit and net
 received before confirmation. Never label the whole allocation a miner fee or
 promise a separate refund. Historical test reports are not current fee quotes.
 
+A VTXO with an exit in progress is not spendable. Overview must leave it out of
+the spendable balance and show it with the exit until the exit finishes or is
+canceled. The database can still say Spendable until every exit transaction has
+been broadcast, so the screen cannot trust that label alone.
+
+The emergency-exit button starts every unspent VTXO, including one that is
+still locked for a board. The VTXO list does not yet offer an exit for that row
+alone. Refresh is the usual way to shorten one coin. Until a per-VTXO exit
+control exists, a single exit is started by that VTXO's id.
+
 ## Failed Lightning sends
 
 Available with Wallet 0.8.3 beta and the Paperclip ASP update deployed October 4, 2026.

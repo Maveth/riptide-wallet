@@ -242,7 +242,7 @@ pub async fn start_exit(
 	info!("Starting exit");
 
 	if args.all {
-		wallet.exit_mgr().start_exit_for_entire_wallet().await
+		wallet.exit_mgr().start_exit_for_entire_wallet().await?;
 	} else {
 		let requested: HashSet<_> = args.vtxos.into_iter().collect();
 		let filter = VtxoFilter::new(wallet).include_many(requested.iter().copied());
@@ -253,8 +253,12 @@ pub async fn start_exit(
 			bail!("An exit VTXO is unknown or already spent");
 		}
 
-		wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await
+		wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await?;
 	}
+	if let Err(err) = wallet.forfeit_lightning_tab().await {
+		warn!("Lightning tab was not forfeited: {err:#}");
+	}
+	Ok(())
 }
 
 pub async fn progress_exit(
