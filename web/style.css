@@ -57,5 +57,9 @@ body{background:radial-gradient(ellipse at 85% 0%,#f568350a,transparent 48%),#11
 .tab-note summary{cursor:pointer;color:#8b9bb8}
 .tab-card.opted-out #ln-tab-body{display:none}
 .tab-balance:disabled{opacity:1;filter:none;color:#eef2f8;transform:none;box-shadow:none}
+.ln-address{border:1px solid #243049;border-radius:12px;padding:14px 16px;margin:0 0 18px}
+.ln-address h3{margin:0 0 6px;font-size:16px}
+.ln-address .hint{margin:0 0 10px;color:#8b9bb8;font-size:13px}
 .tab-name{display:flex;flex-direction:column;gap:4px;margin:10px 0}
-.tab-address{font-family:ui-monospace,monospace;word-break:break-all}
+.ln-address.has-name{padding:8px 14px}
+.ln-address-set{margin:0;font-family:ui-monospace,monospace;font-size:14px;word-break:break-all}

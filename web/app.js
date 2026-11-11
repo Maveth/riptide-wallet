@@ -58,7 +58,7 @@ async function updateBalances(sessionToken) {
   if ($('ln-tab-return')) $('ln-tab-return').disabled = !(Number.isSafeInteger(tab?.balance_sat) && tab.balance_sat >= 1000);
   if ($('ln-tab-opt') && tab) $('ln-tab-opt').checked = tab.opted_out === true;
   const named = await api('lightning/address').catch(() => null);
-  if ($('ln-address')) $('ln-address').textContent = named?.address || '';
+  syncLightningAddress(named?.address || '');
   syncTabCard();
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
@@ -391,6 +391,16 @@ $('ln-tab-fund').onclick = event => run(event.target, async () => {
   if (!await reviewConfirm('Top up 1,000 once', 'Send 1,000 sats from an existing Ark coin into the tab?\n\nThis happens once. It does not repeat, and it does not pay an invoice.\nYour change stays your coin. A unilateral exit forfeits whatever is left.')) return;
   await topUpOnce();
 });
+function syncLightningAddress(address) {
+  const card = $('ln-address-card');
+  const pick = $('ln-address-pick');
+  const shown = $('ln-address');
+  if (!card) return;
+  const has = !!address;
+  card.classList.toggle('has-name', has);
+  if (pick) pick.hidden = has;
+  if (shown) { shown.hidden = !has; shown.textContent = has ? address : ''; }
+}
 function syncTabCard() {
   const card = $('ln-tab-card');
   if (!card || !$('ln-tab-opt')) return;
@@ -401,7 +411,7 @@ if ($('ln-address-claim')) $('ln-address-claim').onclick = () => { run($('ln-add
   if (!name) throw new Error('Type a name first.');
   if (!await reviewConfirm('Claim Lightning address', 'Claim ' + name + '@ark-riptide.maveth.ca?\n\nThe first person to claim a name keeps it. Payments under 1,000 sats credit the tab even if this wallet is closed. 1,000 sats or more become a coin, so this wallet has to be open.')) return;
   const result = await mutate('lightning/address', { name });
-  if ($('ln-address')) $('ln-address').textContent = result.address || '';
+  syncLightningAddress(result.address || (name + '@ark-riptide.maveth.ca'));
   status('Lightning address: ' + (result.address || name));
 }); };
 $('ln-tab-opt').onchange = event => run(event.target, async () => {
