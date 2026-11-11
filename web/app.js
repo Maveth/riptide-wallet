@@ -321,11 +321,6 @@ async function topUpOnce() {
   await update();
   status('Topped up 1,000 sats once. No invoice was paid. Balance: ' + (Number.isSafeInteger(result.balance_sat) ? result.balance_sat.toLocaleString() : 'updated') + ' sats.');
 }
-function syncTabCard() {
-  const card = $('ln-tab-card');
-  if (!card || !$('ln-tab-opt')) return;
-  card.classList.toggle('opted-out', $('ln-tab-opt').checked === true);
-}
 $('ln-pay').onsubmit = event => { event.preventDefault(); run(event.submitter, async () => {
   if (!lightningEnabled) throw new Error('Lightning is not enabled in this wallet recovery profile.');
   const destination = $('ln-destination').value.trim(), amount = sats('ln-amount', true);
