@@ -37,6 +37,75 @@ async function api(path, body, method, signal) {
   }
 }
 let updateInFlight = null;
+function txOutputSats(hex) {
+  if (typeof hex !== 'string' || hex.length % 2 || !/^[0-9a-fA-F]+$/.test(hex)) return null;
+  const raw = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < raw.length; i++) raw[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  const view = new DataView(raw.buffer);
+  let at = 0;
+  const need = (n) => { if (at + n > raw.length) throw new Error('short'); };
+  const compact = () => {
+    need(1);
+    const n = raw[at++];
+    if (n < 0xfd) return n;
+    if (n === 0xfd) { need(2); const v = view.getUint16(at, true); at += 2; return v; }
+    if (n === 0xfe) { need(4); const v = view.getUint32(at, true); at += 4; return v; }
+    need(8);
+    const v = Number(view.getBigUint64(at, true));
+    at += 8;
+    return v;
+  };
+  try {
+    need(4); at += 4;
+    if (raw[at] === 0 && raw[at + 1] === 1) at += 2;
+    const inputs = compact();
+    for (let i = 0; i < inputs; i++) {
+      need(36); at += 36;
+      const script = compact();
+      need(script + 4); at += script + 4;
+    }
+    const outputs = compact();
+    let total = 0;
+    for (let i = 0; i < outputs; i++) {
+      need(8);
+      const value = Number(view.getBigUint64(at, true));
+      at += 8;
+      if (!Number.isSafeInteger(value)) return null;
+      const script = compact();
+      need(script); at += script;
+      total += value;
+    }
+    return Number.isSafeInteger(total) ? total : null;
+  } catch { return null; }
+}
+function renderOverviewPending(chain, txs) {
+  const box = $('overview-pending');
+  if (!box) return;
+  box.replaceChildren();
+  const pendingIn = (Number.isSafeInteger(chain?.trusted_pending_sat) ? chain.trusted_pending_sat : 0)
+    + (Number.isSafeInteger(chain?.untrusted_pending_sat) ? chain.untrusted_pending_sat : 0);
+  const rows = Array.isArray(txs) ? txs.filter(tx => tx && tx.confirmation == null) : [];
+  const withdrawal = [...rows].reverse().find(tx => tx.is_cpfp) || null;
+  const outputSats = withdrawal ? txOutputSats(withdrawal.tx) : null;
+  if (pendingIn <= 0 && outputSats == null) { box.hidden = true; return; }
+  box.hidden = false;
+  const card = document.createElement('article');
+  card.className = 'overview-pending-card';
+  const heading = document.createElement('h2');
+  heading.textContent = withdrawal ? 'Unconfirmed withdrawal' : 'Unconfirmed on-chain';
+  const amount = document.createElement('strong');
+  const shown = outputSats != null ? outputSats : pendingIn;
+  amount.textContent = shown.toLocaleString() + ' sats';
+  const detail = document.createElement('p');
+  const id = typeof withdrawal?.txid === 'string' ? withdrawal.txid.slice(0, 16) + '\u2026' : '';
+  const older = rows.length - (withdrawal ? 1 : 0);
+  const parts = ['Still waiting to be mined.'];
+  if (id) parts.push('Newest transaction ' + id);
+  if (older > 0) parts.push(older + ' older unconfirmed attempts are still in the wallet.');
+  detail.textContent = parts.join(' ');
+  card.append(heading, amount, detail);
+  box.append(card);
+}
 let nextAutomaticUpdate = 0;
 async function update() {
   if (updateInFlight?.session === token) return updateInFlight.promise;
@@ -47,9 +116,9 @@ async function update() {
   finally { if (updateInFlight?.promise === promise) updateInFlight = null; }
 }
 async function updateBalances(sessionToken) {
-  const results = await Promise.allSettled(['wallet/balance', 'onchain/balance', 'wallet/vtxos', 'exits/status/all', 'bitcoin/tip'].map(path => api(path)));
+  const results = await Promise.allSettled(['wallet/balance', 'onchain/balance', 'wallet/vtxos', 'exits/status/all', 'bitcoin/tip', 'onchain/transactions'].map(path => api(path)));
   if (!token || token !== sessionToken) return;
-  const [balance, chain, vtxos, exits, tip] = results.map(result => result.status === 'fulfilled' ? result.value : null);
+  const [balance, chain, vtxos, exits, tip, chainTxs] = results.map(result => result.status === 'fulfilled' ? result.value : null);
   $('exits').textContent = JSON.stringify(exits, null, 2);
   $('ark-balance').textContent = Number.isSafeInteger(balance?.spendable_sat) ? balance.spendable_sat.toLocaleString() : 'Unavailable';
   const tab = await api('lightning/tab').catch(() => null);
@@ -61,6 +130,7 @@ async function updateBalances(sessionToken) {
   syncLightningAddress(named?.address || '');
   syncTabCard();
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
+  renderOverviewPending(chain, chainTxs);
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
   vtxoSnapshot = {balance: balance || {}, rows: Array.isArray(vtxos) ? vtxos : [], tip: Number.isSafeInteger(tip?.tip_height) ? tip.tip_height : null};
   renderVtxos();
@@ -214,7 +284,7 @@ $('send').addEventListener('submit', event => { event.preventDefault(); run(even
 }); });
 for (const id of ['destination', 'amount']) $(id).addEventListener('input', () => { $('ark-estimate').hidden = true; });
 $('refresh').onclick = event => run(event.target, async () => {
-  if (!await PaperclipReview.ask('Refresh all eligible VTXOs? Transaction fees may apply.')) return;
+  if (!await PaperclipReview.ask('Refresh every spendable coin now?\n\nThis is not a check of which ones are due. Every spendable coin joins the next round and gets a new expiry. Fees apply. Locked or exiting coins are left out.')) return;
   await mutate('wallet/refresh/all', {}); await update(); status('Refresh requested. Wait for confirmation and update to check completion.');
 });
 
@@ -467,12 +537,12 @@ $('ln-check').onsubmit = event => { event.preventDefault(); run(event.submitter,
 $('history-load').onclick = event => run(event.target, async () => {
   const session = token;
   const results = await Promise.allSettled([
-    api('history'), api('onchain/transactions'), api('lightning/receives')
+    api('history'), api('onchain/transactions'), api('lightning/receives'), api('lightning/tab/activity')
   ]);
   if (!token || token !== session || $('wallet').hidden) return;
-  const [ark, onchain, receives] = results.map(result => result.status === 'fulfilled' ? result.value : null);
-  $('history').textContent = JSON.stringify({ark, onchain, lightning_receives: receives}, null, 2);
-  if (ark) renderActivity(ark);
+  const [ark, onchain, receives, tab] = results.map(result => result.status === 'fulfilled' ? result.value : null);
+  $('history').textContent = JSON.stringify({ark, onchain, lightning_receives: receives, lightning_tab: tab}, null, 2);
+  if (ark || tab) renderActivity(ark, tab);
   else { $('activity-list').replaceChildren(); $('activity-summary').textContent = 'Activity is unavailable. Check connections and try again.'; }
   status(results.some(result => result.status === 'rejected') ? 'Some activity is unavailable. This does not mean a payment failed.' : 'Activity updated.');
 });
@@ -485,7 +555,9 @@ $('lock').onclick = () => {
   $('ark-estimate').hidden = true; $('ark-estimate-values').textContent = '';
   lightningEnabled = false; $('ln-controls').disabled = true;
   for (const id of ['ln-offer-output', 'ln-invoice', 'ln-result', 'chain-result', 'history', 'ark-balance', 'chain-balance']) $(id).textContent = '';
-  for (const id of ['offer-description', 'offer-amount', 'ln-destination', 'ln-amount', 'ln-receive-amount', 'ln-description', 'ln-identifier', 'chain-destination', 'chain-amount']) $(id).value = '';
+  if ($('overview-pending')) { $('overview-pending').hidden = true; $('overview-pending').replaceChildren(); }
+  for (const id of ['offer-amount', 'ln-destination', 'ln-amount', 'ln-receive-amount', 'ln-description', 'ln-identifier', 'chain-destination', 'chain-amount']) $(id).value = '';
+  if ($('offer-description')) $('offer-description').value = 'Ark Riptide Wallet';
 };
 $('deposit').onclick = event => run(event.target, async () => {
   const receiveSession = token;
@@ -526,16 +598,45 @@ function paymentSummary(title, detail) {
 $('ln-copy').onclick = event => run(event.target, async () => {
   await navigator.clipboard.writeText($('ln-invoice').textContent); status('Invoice copied.');
 });
-function renderActivity(records) {
+function renderActivity(records, tabRows) {
   const list = $('activity-list'); list.replaceChildren();
-  const rows = Array.isArray(records) ? records : [];
-  $('activity-summary').textContent = rows.length + ' Ark movements \u00b7 ' + rows.filter(r => r.status === 'pending').length + ' pending';
+  const movements = Array.isArray(records) ? records : [];
+  const seen = new Set();
+  for (const row of movements) {
+    const hash = row.metadata && row.metadata.payment_hash;
+    if (typeof hash === 'string') seen.add(hash);
+  }
+  const tab = (Array.isArray(tabRows) ? tabRows : []).filter(entry => {
+    if (!entry || seen.has(entry.payment_hash)) return false;
+    return entry.direction === 'received' || entry.direction === 'sent';
+  }).map(entry => ({
+    subsystem: {name: 'bark.lightning_tab', kind: entry.direction},
+    effective_balance_sat: entry.amount_sat,
+    offchain_fee_sat: entry.fee_sat,
+    status: 'successful',
+    time: {created_at: entry.at},
+    input_vtxos: [],
+    metadata: {payment_hash: entry.payment_hash},
+  }));
+  const rows = movements.concat(tab).sort((a, b) => {
+    const left = Date.parse(b.time && b.time.created_at);
+    const right = Date.parse(a.time && a.time.created_at);
+    return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0);
+  });
+  const pending = rows.filter(r => r.status === 'pending').length;
+  $('activity-summary').textContent = rows.length + ' movements \u00b7 ' + pending + ' pending';
   if (!rows.length) { list.textContent = 'No Ark activity yet. Deposits and payments will appear here.'; return; }
   for (const row of rows) {
     const card = document.createElement('article'); card.className = 'activity-row';
     const amount = Number.isSafeInteger(row.effective_balance_sat) ? row.effective_balance_sat : null;
+    const tabSend = row.subsystem?.name === 'bark.lightning_send' && !(row.input_vtxos || []).length;
     const heading = document.createElement('strong');
-    heading.textContent = ({'bark.arkoor':'Ark transfer','bark.lightning_send':'Lightning','bark.lightning_receive':'Lightning','bark.board':'Board','bark.round':'Round'}[row.subsystem?.name] || row.subsystem?.name || 'Ark') + ' \u00b7 ' + (row.subsystem?.kind || 'Movement');
+    const label = row.subsystem?.name === 'bark.lightning_tab'
+      ? 'Lightning tab \u00b7 ' + (row.subsystem.kind === 'sent' ? 'sent' : 'received')
+      : tabSend
+        ? 'Lightning tab \u00b7 sent'
+        : (({'bark.arkoor':'Ark transfer','bark.lightning_send':'Lightning','bark.lightning_receive':'Lightning','bark.board':'Board','bark.round':'Round'}[row.subsystem?.name] || row.subsystem?.name || 'Ark') + ' \u00b7 ' + (row.subsystem?.kind || 'Movement'));
+    heading.textContent = label;
     const value = document.createElement('span'); value.className = amount > 0 ? 'positive' : 'amount';
     value.textContent = amount === null ? 'Amount unavailable' : (amount > 0 ? '+' : '') + amount.toLocaleString() + ' sats';
     const detail = document.createElement('p');

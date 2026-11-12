@@ -18,7 +18,7 @@ use bark_cli::util::output_json;
 pub enum LightningCommand {
 	/// Create a reusable BOLT12 offer. Keep paperclip-walletd running to receive.
 	Offer {
-		#[arg(long, default_value = "Paperclip wallet")]
+		#[arg(long, default_value = "Ark Riptide Wallet")]
 		description: String,
 		#[arg(long)]
 		amount: Option<Amount>,

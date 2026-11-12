@@ -86,6 +86,20 @@ impl Wallet {
 		Ok((Amount::from_sat(resp.balance_sat), resp.opted_out, accounts))
 	}
 
+	/// Credited receives and spent sends from the server ledger.
+	/// A send amount is negative and already includes the fee that stayed on the tab.
+	pub async fn lightning_tab_activity(&self) -> anyhow::Result<Vec<protos::LightningTabActivityEntry>> {
+		let keys = self.tab_keys().await?;
+		let (mut srv, _) = self.require_server().await?;
+		let mut tabs = Vec::with_capacity(keys.len());
+		for key in &keys {
+			tabs.push(self.tab_auth(key, "activity", &[]).await);
+		}
+		let resp = srv.client.list_lightning_tab_activity(protos::LightningTabsRequest { tabs })
+			.await.context("Lightning tab activity failed")?.into_inner();
+		Ok(resp.entries)
+	}
+
 	/// True when any key for this wallet has turned small payments off.
 	pub async fn lightning_tab_opted_out(&self) -> anyhow::Result<bool> {
 		Ok(self.tab_snapshot().await?.1)

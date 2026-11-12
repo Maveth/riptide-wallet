@@ -54,6 +54,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/pay", post(pay))
 		.route("/address", get(lightning_address).post(claim_lightning_address))
 		.route("/tab", get(lightning_tab))
+		.route("/tab/activity", get(lightning_tab_activity))
 		.route("/tab/fund", post(fund_lightning_tab))
 		.route("/tab/return", post(return_lightning_tab))
 		.route("/tab/opt", post(set_lightning_tab_opt))
@@ -367,6 +368,20 @@ pub async fn claim_lightning_address(
 	let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
 	let address = wallet.claim_lightning_address(name).await.context("Failed to claim the Lightning address")?;
 	Ok(Json(serde_json::json!({ "address": address })))
+}
+
+pub async fn lightning_tab_activity(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
+	let wallet = state.require_wallet()?;
+	let entries = wallet.lightning_tab_activity().await
+		.context("Failed to read Lightning tab activity")?;
+	let rows = entries.into_iter().map(|entry| serde_json::json!({
+		"direction": entry.direction,
+		"amount_sat": entry.amount_sat,
+		"fee_sat": entry.fee_sat,
+		"at": entry.at,
+		"payment_hash": entry.payment_hash,
+	})).collect::<Vec<_>>();
+	Ok(Json(serde_json::Value::Array(rows)))
 }
 
 pub async fn lightning_tab(State(state): State<Arc<ServerState>>) -> HandlerResult<Json<serde_json::Value>> {
