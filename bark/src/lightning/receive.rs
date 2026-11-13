@@ -17,8 +17,15 @@ use crate::movement::MovementStatus;
 use crate::movement::update::MovementUpdate;
 use crate::vtxo::VtxoStateKind;
 
+fn invoice_created_secs(invoice: &ark::lightning::Invoice) -> u64 {
+	match invoice {
+		ark::lightning::Invoice::Bolt11(invoice) => invoice.duration_since_epoch().as_secs(),
+		ark::lightning::Invoice::Bolt12(invoice) => invoice.created_at().as_secs(),
+	}
+}
+
 impl Wallet {
-	/// Returns every in-progress lightning receive checkpoint, newest first.
+	/// Returns every in-progress lightning receive checkpoint, newest invoice first.
 	pub async fn pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>> {
 		let mut result = Vec::new();
 		for cp in self.inner.db.get_all_wallet_action_checkpoints().await? {
@@ -26,6 +33,7 @@ impl Wallet {
 				result.push(recv);
 			}
 		}
+		result.sort_by_key(|recv| std::cmp::Reverse(invoice_created_secs(&recv.invoice)));
 		Ok(result)
 	}
 
@@ -50,18 +58,24 @@ impl Wallet {
 	}
 
 	/// Drives every pending lightning receive forward by one step (or to
-	/// completion if it's ready). Each action runs to its next park
-	/// independently; errors on one don't stop the others.
+	/// completion if it's ready). The newest invoice is started first.
+	/// Different payments run together. Each payment keeps its own lock, so
+	/// one receive cannot be driven twice, and an old one cannot hold up a
+	/// new one. A server-side cancel or an expired unpaid invoice ends that
+	/// receive on the drive that sees it. The preimage stays unrevealed.
 	pub async fn sync_pending_lightning_receives(&self) -> anyhow::Result<()> {
 		let pending = self.pending_lightning_receives().await?;
 		if pending.is_empty() {
 			return Ok(());
 		}
 		info!("Syncing {} pending lightning receives", pending.len());
+		let mut drives = futures::stream::FuturesUnordered::new();
 		for recv in pending {
-			let id = recv.id();
-			if let Err(e) = self.drive_action(recv, DriveMode::UntilParkOrDone).await {
-				warn!("Failed to sync lightning receive {}: {:#}", id, e);
+			drives.push(self.drive_action(recv, DriveMode::UntilParkOrDone));
+		}
+		while let Some(result) = drives.next().await {
+			if let Err(e) = result {
+				warn!("Failed to sync lightning receive: {:#}", e);
 			}
 		}
 		Ok(())

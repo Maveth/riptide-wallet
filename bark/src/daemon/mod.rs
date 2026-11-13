@@ -384,16 +384,29 @@ impl DaemonProcess {
 	/// restart that whole task from the top, and exit progression must not
 	/// stay blocked behind it.
 	async fn run_exit_progress_process(&self) {
+		let mut last_tip = None;
 		loop {
 			if let Some(wallet) = self.wallet() {
-				if wallet.inner.onchain.is_some() {
+				let tip = match wallet.chain().tip().await {
+					Ok(tip) => Some(tip),
+					Err(e) => {
+						warn!("Exit progress skipped; chain tip unavailable: {e:#}");
+						None
+					},
+				};
+				if tip.is_some() && tip == last_tip {
+					// The exit package does not need another broadcast until
+					// the chain moves. A missing transaction is seen then.
+				} else if wallet.inner.onchain.is_some() {
 					if let Err(e) = wallet.exit_mgr().progress_exits_with_cpfp(&wallet, None).await {
 						warn!("An error occurred while progressing exits: {:#}", e);
 					}
+					last_tip = tip;
 				} else {
 					if let Err(e) = wallet.exit_mgr().progress_exits(&wallet).await {
 						warn!("An error occurred while progressing exits: {:#}", e);
 					}
+					last_tip = tip;
 				}
 			} else {
 				info!("Wallet has been dropped. Shutting down exit progress process...");
