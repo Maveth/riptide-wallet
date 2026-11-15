@@ -223,7 +223,10 @@ impl VtxoTreeSpec {
 
 	/// Select the funded profile before the funding transaction or signatures exist.
 	pub fn with_exit_funding(mut self, funding: TreeExitFunding) -> Result<Self, &'static str> {
-		if funding.miner_fee() < Amount::from_sat(1000) {
+		// Zero anchor and zero miner fee is the round and pool tree. A smaller
+		// non-zero miner fee is an ordinary transfer budget, not a tree.
+		let zero_fee_tree = funding.anchor() == Amount::ZERO && funding.miner_fee() == Amount::ZERO;
+		if !zero_fee_tree && funding.miner_fee() < Amount::from_sat(1000) {
 			return Err("economical transfer funding is not a tree budget");
 		}
 		if self.vtxos.len() < 2 { return Err("funded tree requires at least two leaves; use a board for one balance"); }

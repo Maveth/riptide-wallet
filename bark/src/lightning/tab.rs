@@ -48,17 +48,39 @@ impl Wallet {
 	}
 
 	async fn tab_keys(&self) -> anyhow::Result<Vec<Keypair>> {
-		let mut keys = vec![self.inner.seed.to_mailbox_keypair()];
-		if let Some(last) = self.inner.db.get_last_vtxo_key_index().await? {
-			for index in 0..=last {
-				if let Ok(key) = self.peek_keypair(index).await {
-					if key.public_key() != keys[0].public_key() {
-						keys.push(key);
-					}
+		let pairs = self.tab_keypairs().await?;
+		Ok(pairs.into_iter().map(|(_, key)| key).collect())
+	}
+
+	/// Mailbox key, plus every VTXO key before the one-time scan. After the
+	/// scan, only keys that still have a balance.
+	async fn tab_keypairs(&self) -> anyhow::Result<Vec<(Option<u32>, Keypair)>> {
+		let mailbox = self.inner.seed.to_mailbox_keypair();
+		let mut keys = vec![(None, mailbox.clone())];
+		let indexes = if self.inner.db.tab_keys_scanned().await? {
+			self.inner.db.tab_key_indexes().await?
+		} else if let Some(last) = self.inner.db.get_last_vtxo_key_index().await? {
+			(0..=last).collect()
+		} else {
+			Vec::new()
+		};
+		for index in indexes {
+			if let Ok(key) = self.peek_keypair(index).await {
+				if key.public_key() != mailbox.public_key() {
+					keys.push((Some(index), key));
 				}
 			}
 		}
 		Ok(keys)
+	}
+
+	async fn remember_tab_keys(&self, accounts: &[(Option<u32>, Keypair, Amount)]) -> anyhow::Result<()> {
+		let indexes = accounts.iter().filter_map(|(index, _, amount)| {
+			if amount.to_sat() > 0 { *index } else { None }
+		}).collect::<Vec<_>>();
+		self.inner.db.set_tab_key_indexes(&indexes).await?;
+		self.inner.db.set_tab_keys_scanned().await?;
+		Ok(())
 	}
 
 	/// Balance and opt-out from one server call.
@@ -67,23 +89,38 @@ impl Wallet {
 		Ok((balance, opted_out))
 	}
 
-	/// One server call for every key. The opt-out flag comes back with the balance.
+	/// The server refuses more than 1024 keys in one call. This wallet has
+	/// thousands of old VTXO keys, so the read goes out in smaller batches.
 	async fn tab_snapshot(&self) -> anyhow::Result<(Amount, bool, Vec<(Keypair, Amount)>)> {
-		let keys = self.tab_keys().await?;
+		let first_scan = !self.inner.db.tab_keys_scanned().await?;
+		let keys = self.tab_keypairs().await?;
 		let (mut srv, _) = self.require_server().await?;
-		let mut tabs = Vec::with_capacity(keys.len());
-		for key in &keys {
-			tabs.push(self.tab_auth(key, "balance", &[]).await);
+		let mut accounts = Vec::with_capacity(keys.len());
+		let mut balance = Amount::ZERO;
+		let mut opted_out = false;
+		for chunk in keys.chunks(512) {
+			let mut tabs = Vec::with_capacity(chunk.len());
+			for (_, key) in chunk {
+				tabs.push(self.tab_auth(key, "balance", &[]).await);
+			}
+			let resp = srv.client.get_lightning_tabs(protos::LightningTabsRequest { tabs })
+				.await.context("Lightning tab balance failed")?.into_inner();
+			if resp.tabs.len() != chunk.len() {
+				bail!("Lightning tab reply did not cover every key");
+			}
+			balance = balance.checked_add(Amount::from_sat(resp.balance_sat))
+				.context("tab balance overflow")?;
+			opted_out |= resp.opted_out;
+			accounts.extend(chunk.iter().zip(resp.tabs).map(|((index, key), entry)| {
+				(*index, key.clone(), Amount::from_sat(entry.balance_sat))
+			}));
 		}
-		let resp = srv.client.get_lightning_tabs(protos::LightningTabsRequest { tabs })
-			.await.context("Lightning tab balance failed")?.into_inner();
-		if resp.tabs.len() != keys.len() {
-			bail!("Lightning tab reply did not cover every key");
+		let dropped = accounts.iter().any(|(index, _, amount)| index.is_some() && amount.to_sat() == 0);
+		if first_scan || dropped {
+			self.remember_tab_keys(&accounts).await?;
 		}
-		let accounts = keys.into_iter().zip(resp.tabs).map(|(key, entry)| {
-			(key, Amount::from_sat(entry.balance_sat))
-		}).collect();
-		Ok((Amount::from_sat(resp.balance_sat), resp.opted_out, accounts))
+		let accounts = accounts.into_iter().map(|(_, key, amount)| (key, amount)).collect();
+		Ok((balance, opted_out, accounts))
 	}
 
 	/// Credited receives and spent sends from the server ledger.
@@ -91,13 +128,17 @@ impl Wallet {
 	pub async fn lightning_tab_activity(&self) -> anyhow::Result<Vec<protos::LightningTabActivityEntry>> {
 		let keys = self.tab_keys().await?;
 		let (mut srv, _) = self.require_server().await?;
-		let mut tabs = Vec::with_capacity(keys.len());
-		for key in &keys {
-			tabs.push(self.tab_auth(key, "activity", &[]).await);
+		let mut entries = Vec::new();
+		for chunk in keys.chunks(512) {
+			let mut tabs = Vec::with_capacity(chunk.len());
+			for key in chunk {
+				tabs.push(self.tab_auth(key, "activity", &[]).await);
+			}
+			let resp = srv.client.list_lightning_tab_activity(protos::LightningTabsRequest { tabs })
+				.await.context("Lightning tab activity failed")?.into_inner();
+			entries.extend(resp.entries);
 		}
-		let resp = srv.client.list_lightning_tab_activity(protos::LightningTabsRequest { tabs })
-			.await.context("Lightning tab activity failed")?.into_inner();
-		Ok(resp.entries)
+		Ok(entries)
 	}
 
 	/// True when any key for this wallet has turned small payments off.

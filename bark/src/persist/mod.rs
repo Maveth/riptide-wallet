@@ -711,6 +711,18 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// Spent VTXOs were forfeited to the server and carry no recoverable
 	/// value.
 	async fn get_unregistered_vtxo_ids(&self) -> anyhow::Result<Vec<VtxoId>>;
+
+	/// True after this wallet has scanned once for Lightning tab balances.
+	async fn tab_keys_scanned(&self) -> anyhow::Result<bool> { Ok(false) }
+
+	/// VTXO key indexes that had a Lightning tab balance on the last read.
+	async fn tab_key_indexes(&self) -> anyhow::Result<Vec<u32>> { Ok(Vec::new()) }
+
+	/// Replace the remembered Lightning tab key indexes.
+	async fn set_tab_key_indexes(&self, _indexes: &[u32]) -> anyhow::Result<()> { Ok(()) }
+
+	/// Record that the one-time Lightning tab key scan has finished.
+	async fn set_tab_keys_scanned(&self) -> anyhow::Result<()> { Ok(()) }
 }
 
 /// Return the recommended [`BarkPersister`] backend for the current

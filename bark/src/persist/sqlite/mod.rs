@@ -456,6 +456,26 @@ impl BarkPersister for SqliteClient {
 		query::get_unregistered_vtxo_ids(&conn)
 	}
 
+	async fn tab_keys_scanned(&self) -> anyhow::Result<bool> {
+		let conn = self.connect()?;
+		query::tab_keys_scanned(&conn)
+	}
+
+	async fn tab_key_indexes(&self) -> anyhow::Result<Vec<u32>> {
+		let conn = self.connect()?;
+		query::tab_key_indexes(&conn)
+	}
+
+	async fn set_tab_key_indexes(&self, indexes: &[u32]) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_tab_key_indexes(&conn, indexes)
+	}
+
+	async fn set_tab_keys_scanned(&self) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_tab_keys_scanned(&conn)
+	}
+
 }
 
 #[cfg(any(test, doc))]

@@ -223,9 +223,42 @@ pub fn update_movement(tx: &Transaction, movement: &Movement) -> anyhow::Result<
 	Ok(())
 }
 
+pub fn tab_keys_scanned(conn: &Connection) -> anyhow::Result<bool> {
+	let scanned: i64 = conn.query_row(
+		"SELECT scanned FROM bark_tab_state WHERE id = 1",
+		[],
+		|row| row.get(0),
+	).context("failed to read bark_tab_state")?;
+	Ok(scanned != 0)
+}
+
+pub fn set_tab_keys_scanned(conn: &Connection) -> anyhow::Result<()> {
+	conn.execute("UPDATE bark_tab_state SET scanned = 1 WHERE id = 1", [])
+		.context("failed to mark the Lightning tab key scan done")?;
+	Ok(())
+}
+
+pub fn tab_key_indexes(conn: &Connection) -> anyhow::Result<Vec<u32>> {
+	let mut statement = conn.prepare("SELECT idx FROM bark_tab_key ORDER BY idx")?;
+	let rows = statement.query_map([], |row| row.get(0))?;
+	rows.collect::<Result<Vec<u32>, _>>().context("failed to read Lightning tab keys")
+}
+
+pub fn set_tab_key_indexes(conn: &Connection, indexes: &[u32]) -> anyhow::Result<()> {
+	conn.execute("DELETE FROM bark_tab_key", [])
+		.context("failed to clear Lightning tab keys")?;
+	for idx in indexes {
+		conn.execute("INSERT INTO bark_tab_key (idx) VALUES (?1)", [idx])
+			.context("failed to store a Lightning tab key")?;
+	}
+	Ok(())
+}
+
 pub fn get_all_movements(conn: &Connection) -> anyhow::Result<Vec<Movement>> {
 	let mut statement = conn.prepare(
-		"SELECT * FROM bark_movements_view ORDER BY created_at DESC, id DESC",
+		"SELECT * FROM bark_movements_view
+		WHERE NOT (status = 'failed' AND subsystem_name = 'bark.round' AND movement_kind = 'refresh')
+		ORDER BY created_at DESC, id DESC",
 	)?;
 	let mut rows = statement.query([])?;
 	let mut results = Vec::new();

@@ -23,9 +23,12 @@ async function api(path, body, method, signal) {
     if (response.status === 401) throw new Error('Access denied. Check the login instructions and the credential provided by your wallet app.');
     let message = '';
     try { const detail = await response.json(); message = typeof detail.message === 'string' ? detail.message.slice(0, 900) : ''; } catch {}
+    const refused = new Error(message || 'Wallet request failed (' + response.status + '). Check wallet access and local services.');
+    refused.status = response.status;
     if (message.includes('no pending lightning receive')) message = 'No received payment matches this invoice in this wallet. An invoice from another wallet belongs in Pay someone, not Received status.';
     if (message.toLowerCase().includes('dust') || message.includes('funded-HTLC minimum') || message.includes('No constructible Lightning input')) message = path === 'fees/ark/send' ? 'Ark payment or change is too small after recovery reserves. Check your balance and amount, or refresh eligible inputs. No payment was sent.' : 'Available Ark inputs cannot cover this payment with valid recovery reserves and change. Refresh eligible inputs to consolidate funds, or add Ark funds. Check Sent status before retrying.';
-    throw new Error(message || 'Wallet request failed (' + response.status + '). Check wallet access and local services.');
+    refused.message = message || refused.message;
+    throw refused;
   }
   return response.status === 204 ? null : await response.json();
   } catch (error) {
@@ -298,6 +301,10 @@ async function mutate(path, body) {
   let result;
   try { result = await api(path, body); }
   catch (error) {
+    if (error.status >= 400 && error.status < 500) {
+      uncertainMutation = false; sessionWrite('paperclip.uncertain', null); $('submission-warning').hidden = true;
+      throw error;
+    }
     if (token === session && token) transactionResult('unknown', 'Result not confirmed', 'The wallet could not confirm the result. Check Activity and payment status before trying again.');
     throw error;
   }
@@ -420,21 +427,25 @@ $('ln-pay').onsubmit = event => { event.preventDefault(); run(event.submitter, a
   }
   if (!token || token !== paymentSession || $('wallet').hidden || destination !== $('ln-destination').value.trim() || amount !== sats('ln-amount', true)) throw new Error('Payment details changed. Review them again. No payment was sent.');
   const tabNow = await api('lightning/tab').catch(() => null);
-  const tabBalance = Number.isSafeInteger(tabNow?.balance_sat) ? tabNow.balance_sat : 0;
+  const tabKnown = Number.isSafeInteger(tabNow?.balance_sat);
+  const tabBalance = tabKnown ? tabNow.balance_sat : null;
   let tabAffordable = false;
   if (!fromTab) {
     try {
       const tabParams = new URLSearchParams(params);
       tabParams.set('source', 'tab');
       const tabQuote = await api('fees/lightning/pay?' + tabParams.toString());
-      tabAffordable = tabQuote.from_tab === true && tabBalance >= tabQuote.gross_amount_sat && tabQuote.gross_amount_sat === tabQuote.net_amount_sat + tabQuote.fee_sat;
+      tabAffordable = tabKnown && tabQuote.from_tab === true && tabBalance >= tabQuote.gross_amount_sat && tabQuote.gross_amount_sat === tabQuote.net_amount_sat + tabQuote.fee_sat;
       if (tabAffordable) costs += '\n\nThe tab can also pay this: ' + tabQuote.gross_amount_sat.toLocaleString() + ' sats, with no new coin.';
+      else if (!tabKnown) costs += '\n\nThe tab balance could not be read. This payment can still be made from a coin.';
     } catch { tabAffordable = false; }
   } else {
-    tabAffordable = tabBalance >= quote.gross_amount_sat;
-    if (!tabAffordable) costs += '\n\nThe tab has ' + tabBalance.toLocaleString() + ' sats. Top up 1,000 once, then review this payment again.';
+    tabAffordable = tabKnown && tabBalance >= quote.gross_amount_sat;
+    if (!tabKnown) costs += '\n\nThe tab balance could not be read, so this small payment cannot be priced from the tab.';
+    else if (!tabAffordable) costs += '\n\nThe tab has ' + tabBalance.toLocaleString() + ' sats. Top up 1,000 once, then review this payment again.';
   }
-  const picked = await reviewPay('Lightning payment', 'Pay ' + (amount === null ? 'the invoice amount' : amount.toLocaleString() + ' sats') + ' on ' + network + '?\n' + destination + '\n\n' + costs, {
+  const shownDestination = destination.length > 80 ? destination.slice(0, 24) + '\u2026' + destination.slice(-16) : destination;
+  const picked = await reviewPay('Lightning payment', 'Pay ' + (amount === null ? 'the invoice amount' : amount.toLocaleString() + ' sats') + ' on ' + network + '?\n' + shownDestination + '\n\n' + costs, {
     coin: !fromTab, tab: tabAffordable, topup: false
   });
   if (picked !== 'coin' && picked !== 'tab') return;
@@ -623,10 +634,24 @@ function renderActivity(records, tabRows) {
     const right = Date.parse(a.time && a.time.created_at);
     return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0);
   });
-  const pending = rows.filter(r => r.status === 'pending').length;
-  $('activity-summary').textContent = rows.length + ' movements \u00b7 ' + pending + ' pending';
-  if (!rows.length) { list.textContent = 'No Ark activity yet. Deposits and payments will appear here.'; return; }
-  for (const row of rows) {
+  const failedRefresh = row => row.status === 'failed' && row.subsystem?.name === 'bark.round' && row.subsystem?.kind === 'refresh';
+  const failedRefreshes = rows.filter(failedRefresh);
+  const shown = rows.filter(row => !failedRefresh(row));
+  const pending = shown.filter(r => r.status === 'pending').length;
+  $('activity-summary').textContent = shown.length + ' movements \u00b7 ' + pending + ' pending' + (failedRefreshes.length ? ' \u00b7 ' + failedRefreshes.length.toLocaleString() + ' failed refreshes grouped' : '');
+  if (!shown.length && !failedRefreshes.length) { list.textContent = 'No Ark activity yet. Deposits and payments will appear here.'; return; }
+  if (failedRefreshes.length) {
+    const fees = [...new Set(failedRefreshes.map(row => row.offchain_fee_sat).filter(Number.isSafeInteger))].sort((a, b) => a - b);
+    const newest = failedRefreshes.map(row => Date.parse(row.time?.created_at)).filter(Number.isFinite).sort((a, b) => b - a)[0];
+    const card = document.createElement('article'); card.className = 'activity-row';
+    const heading = document.createElement('strong'); heading.textContent = 'Round \u00b7 refresh';
+    const value = document.createElement('span'); value.className = 'amount'; value.textContent = failedRefreshes.length.toLocaleString() + ' failed';
+    const badge = document.createElement('span'); badge.className = 'activity-state'; badge.textContent = 'Failed';
+    const detail = document.createElement('p');
+    detail.textContent = 'These attempts did not finish a round. The fee was not taken. Fees recorded: ' + (fees.length ? fees.map(fee => fee.toLocaleString()).join(' and ') + ' sats' : 'unavailable') + (Number.isFinite(newest) ? '. Newest ' + new Date(newest).toLocaleString() : '') + '.';
+    card.append(heading, value, badge, detail); list.append(card);
+  }
+  for (const row of shown) {
     const card = document.createElement('article'); card.className = 'activity-row';
     const amount = Number.isSafeInteger(row.effective_balance_sat) ? row.effective_balance_sat : null;
     const tabSend = row.subsystem?.name === 'bark.lightning_send' && !(row.input_vtxos || []).length;
@@ -671,7 +696,7 @@ $('lock').onclick = () => { sessionWrite('paperclip.session', null); sessionLock
 const sessionSetupLock = $('setup-lock').onclick;
 $('setup-lock').onclick = () => { sessionWrite('paperclip.session', null); sessionSetupLock(); };
 $('submission-reviewed').onclick = async () => {
-  if (!await PaperclipReview.ask('Have you checked Activity and the payment status? Continue only after resolving the previous submission. A pending payment must not be sent again.')) return;
+  if (!await PaperclipReview.ask('Clear the hold from the last submit? This does not send a payment. A payment that is still pending must not be sent again.')) return;
   uncertainMutation = false; sessionWrite('paperclip.uncertain', null); $('submission-warning').hidden = true;
   status('Previous result acknowledged. No payment has been resubmitted.');
 };
