@@ -13,17 +13,14 @@ use bitcoin::constants::ChainHash;
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use bitcoin::secp256k1::{ecdh::SharedSecret, Keypair, PublicKey, Scalar, SecretKey};
 use lightning::blinded_path::{BlindedHop, message::BlindedMessagePath};
-use lightning::blinded_path::payment::{
-	BlindedPaymentPath, Bolt12OfferContext, PaymentConstraints, PaymentContext,
-	UnauthenticatedReceiveTlvs,
-};
+use lightning::blinded_path::payment::{BlindedPayInfo, BlindedPaymentPath};
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
-use lightning::offers::invoice_request::{InvoiceRequest, InvoiceRequestFields};
+use lightning::offers::invoice_request::InvoiceRequest;
 use lightning::offers::nonce::Nonce;
 use lightning::offers::offer::{Amount as OfferAmount, Offer, OfferBuilder};
 use lightning::sign::EntropySource;
-use lightning::types::payment::PaymentSecret;
+use lightning::types::features::BlindedHopFeatures;
 use lightning::util::ser::{BigSize, Readable, Writeable};
 
 use crate::lightning::Preimage;
@@ -130,6 +127,52 @@ fn relay_message_path(relay: PublicKey) -> Result<BlindedMessagePath, ReceiveErr
 		vec![BlindedHop { blinded_node_id, encrypted_payload }]))
 }
 
+/// Token the hold plugin compares with the arriving HTLC. Derived from the
+/// payment hash so the server can rebuild it without the wallet's key.
+pub fn hold_path_id(payment_hash: &[u8]) -> [u8; 32] {
+	let mut engine = HmacEngine::<sha256::Hash>::new(b"Paperclip XBT BOLT12 hold path id v1");
+	engine.input(payment_hash);
+	Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+}
+
+/// One-hop payment path Core Lightning can pay. The encrypted hop carries the
+/// standard payment constraints plus a 32-byte path id. CLN copies that id
+/// into the HTLC payment secret, which is what the existing hold plugin checks.
+fn relay_payment_path(
+	relay: PublicKey, cltv_delta: u16, maximum_height: u32, payment_hash: &[u8],
+) -> Result<BlindedPaymentPath, ReceiveError> {
+	let mut constraints = Vec::with_capacity(8);
+	constraints.extend_from_slice(&maximum_height.to_be_bytes());
+	BigSize(1).write(&mut constraints).expect("Vec write");
+	let mut plain = Vec::new();
+	append_record(&mut plain, 6, &hold_path_id(payment_hash));
+	append_record(&mut plain, 12, &constraints);
+
+	let secret = SecretKey::from_slice(&Entropy.get_secure_random_bytes()).map_err(ldk_error)?;
+	let path_key = PublicKey::from_secret_key(&SECP, &secret);
+	let shared = SharedSecret::new(&relay, &secret);
+	let subkey = |label: &[u8]| {
+		let mut engine = HmacEngine::<sha256::Hash>::new(label);
+		engine.input(shared.as_ref());
+		Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+	};
+	let tweak = Scalar::from_be_bytes(subkey(b"blinded_node_id")).map_err(ldk_error)?;
+	let blinded_node_id = relay.mul_tweak(&SECP, &tweak).map_err(ldk_error)?;
+	let cipher = ChaCha20Poly1305::new(&subkey(b"rho").into());
+	let encrypted_payload = cipher.encrypt(&[0u8; 12].into(), plain.as_ref()).map_err(ldk_error)?;
+	Ok(BlindedPaymentPath::from_blinded_path_and_payinfo(
+		relay, path_key, vec![BlindedHop { blinded_node_id, encrypted_payload }],
+		BlindedPayInfo {
+			fee_base_msat: 0,
+			fee_proportional_millionths: 0,
+			cltv_expiry_delta: cltv_delta,
+			htlc_minimum_msat: 1,
+			htlc_maximum_msat: u64::MAX,
+			features: BlindedHopFeatures::empty(),
+		},
+	))
+}
+
 /// Extract the exact offer fields from a signed invoice request.
 pub fn request_offer(bytes: &[u8]) -> Result<Offer, ReceiveError> {
 	let mut encoded = Vec::new();
@@ -177,20 +220,7 @@ pub fn create_invoice(
 ) -> Result<Bolt12Invoice, ReceiveError> {
 	if offer.issuer_signing_pubkey() != Some(key.public_key()) { return Err(invalid("wrong signing key")); }
 	if cltv_delta == 0 { return Err(invalid("zero CLTV delta")); }
-	let entropy = Entropy;
-	let tlvs = UnauthenticatedReceiveTlvs {
-		payment_secret: PaymentSecret(rand::random()),
-		payment_constraints: PaymentConstraints { max_cltv_expiry: maximum_height, htlc_minimum_msat: 1 },
-		payment_context: PaymentContext::Bolt12Offer(Bolt12OfferContext {
-			offer_id: offer.id(), invoice_request: InvoiceRequestFields {
-				payer_signing_pubkey: request.payer_signing_pubkey(),
-				quantity: request.quantity(),
-				payer_note_truncated: None,
-				human_readable_name: request.offer_from_hrn().clone(),
-			},
-		}),
-	}.authenticate(Nonce::from_entropy_source(&entropy), &ExpandedKey::new(rand::random()));
-	let path = BlindedPaymentPath::one_hop(relay, tlvs, cltv_delta, &entropy, &SECP).map_err(ldk_error)?;
+	let path = relay_payment_path(relay, cltv_delta, maximum_height, preimage.compute_payment_hash().as_ref())?;
 	let unsigned = request.respond_with(vec![path], lightning::types::payment::PaymentHash(
 		preimage.compute_payment_hash().to_byte_array(),
 	)).map_err(ldk_error)?.relative_expiry(900).build().map_err(ldk_error)?;
