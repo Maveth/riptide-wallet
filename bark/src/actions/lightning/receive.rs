@@ -337,6 +337,7 @@ pub(crate) async fn start_lightning_receive(
 	wallet: &Wallet,
 	amount: Amount,
 	description: Option<String>,
+	description_hash: Option<Vec<u8>>,
 	token: Option<String>,
 	claim_destination: Option<ark::Address>,
 ) -> anyhow::Result<LightningReceive> {
@@ -399,6 +400,7 @@ pub(crate) async fn start_lightning_receive(
 		min_cltv_delta: requested_min_cltv_delta.into(),
 		mailbox_id: Some(mailbox_id.serialize()),
 		description,
+		description_hash,
 		tab_user_pubkey: from_tab.then(|| mailbox_kp.public_key().serialize().to_vec()),
 		tab_signature: from_tab.then(|| crate::lightning::tab::tab_signature(
 			&mailbox_kp, "receive", payment_hash.as_ref(),

@@ -135,7 +135,7 @@ async function updateBalances(sessionToken) {
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
   renderOverviewPending(chain, chainTxs);
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
-  vtxoSnapshot = {balance: balance || {}, rows: Array.isArray(vtxos) ? vtxos : [], tip: Number.isSafeInteger(tip?.tip_height) ? tip.tip_height : null};
+  vtxoSnapshot = {balance: balance || {}, rows: Array.isArray(vtxos) ? vtxos : [], tip: Number.isSafeInteger(tip?.tip_height) ? tip.tip_height : null, exits: Array.isArray(exits) ? exits : []};
   renderVtxos();
   if (!vtxos || !balance) {
     $('vtxo-list').replaceChildren(); $('vtxo-summary').textContent = 'Recovery balances are unavailable. Check connections and try again.';
@@ -419,8 +419,8 @@ $('ln-pay').onsubmit = event => { event.preventDefault(); run(event.submitter, a
     if (quote.tab_required === true || quote.from_tab === true) {
       fromTab = true;
       costs = quote.route_priced === false
-        ? 'The route fee is not known yet. The tab will hold ' + quote.fee_sat.toLocaleString() + ' sats, on top of the ' + quote.net_amount_sat.toLocaleString() + ' sat invoice.\nAfter the payment, the tab keeps the route cost plus 1 sat and puts the rest back.\nA unilateral exit forfeits whatever is still on the tab.'
-        : 'This invoice is under 1,000 sats, so it is paid from the tab.\nInvoice ' + quote.net_amount_sat.toLocaleString() + ' sats plus ' + quote.fee_sat.toLocaleString() + ' sats from the tab.\nArk pays it. No new coin is created. A unilateral exit forfeits the leftover tab.';
+        ? 'The route fee is not known yet. The tab will hold ' + quote.fee_sat.toLocaleString() + ' sats, on top of the ' + quote.net_amount_sat.toLocaleString() + ' sat invoice.\nAfter the payment, the tab keeps the route cost plus 1 sat and puts the rest back.\nAn emergency exit leaves the tab balance where it is.'
+        : 'This invoice is under 1,000 sats, so it is paid from the tab.\nInvoice ' + quote.net_amount_sat.toLocaleString() + ' sats plus ' + quote.fee_sat.toLocaleString() + ' sats from the tab.\nArk pays it. No new coin is created. An emergency exit leaves the tab balance where it is.';
     } else {
       costs = 'Estimated total from your coin: ' + quote.gross_amount_sat.toLocaleString() + ' sats\nIncludes ' + quote.fee_sat.toLocaleString() + ' sats.\nA found route is charged as that route plus 1 sat. Otherwise this is the schedule fee. The payment is not sent when it cannot be routed.';
     }
@@ -619,7 +619,7 @@ function renderActivity(records, tabRows) {
   }
   const tab = (Array.isArray(tabRows) ? tabRows : []).filter(entry => {
     if (!entry || seen.has(entry.payment_hash)) return false;
-    return entry.direction === 'received' || entry.direction === 'sent';
+    return entry.direction === 'received' || entry.direction === 'sent' || entry.direction === 'fee-return';
   }).map(entry => ({
     subsystem: {name: 'bark.lightning_tab', kind: entry.direction},
     effective_balance_sat: entry.amount_sat,
@@ -657,7 +657,7 @@ function renderActivity(records, tabRows) {
     const tabSend = row.subsystem?.name === 'bark.lightning_send' && !(row.input_vtxos || []).length;
     const heading = document.createElement('strong');
     const label = row.subsystem?.name === 'bark.lightning_tab'
-      ? 'Lightning tab \u00b7 ' + (row.subsystem.kind === 'sent' ? 'sent' : 'received')
+      ? 'Lightning tab \u00b7 ' + (row.subsystem.kind === 'sent' ? 'sent' : row.subsystem.kind === 'fee-return' ? 'fee returned' : 'received')
       : tabSend
         ? 'Lightning tab \u00b7 sent'
         : (({'bark.arkoor':'Ark transfer','bark.lightning_send':'Lightning','bark.lightning_receive':'Lightning','bark.board':'Board','bark.round':'Round'}[row.subsystem?.name] || row.subsystem?.name || 'Ark') + ' \u00b7 ' + (row.subsystem?.kind || 'Movement'));
@@ -666,7 +666,9 @@ function renderActivity(records, tabRows) {
     value.textContent = amount === null ? 'Amount unavailable' : (amount > 0 ? '+' : '') + amount.toLocaleString() + ' sats';
     const detail = document.createElement('p');
     const date = new Date(row.time?.created_at);
-    detail.textContent = (row.status || 'Unknown') + ' \u00b7 ' + (Number.isFinite(date.getTime()) ? date.toLocaleString() : 'Time unavailable') + ' \u00b7 Fee: ' + (Number.isSafeInteger(row.offchain_fee_sat) ? row.offchain_fee_sat.toLocaleString() + ' sats' : 'unavailable');
+    const returned = Number(row.metadata && row.metadata.fee_returned_sat);
+    const feeText = Number.isSafeInteger(row.offchain_fee_sat) ? row.offchain_fee_sat.toLocaleString() + ' sats' : 'unavailable';
+    detail.textContent = (row.status || 'Unknown') + ' \u00b7 ' + (Number.isFinite(date.getTime()) ? date.toLocaleString() : 'Time unavailable') + ' \u00b7 Fee: ' + feeText + (Number.isSafeInteger(returned) && returned > 0 ? ' \u00b7 ' + returned.toLocaleString() + ' sats returned to the Lightning tab' : '');
     const badge = document.createElement('span'); badge.className = 'activity-state';
     badge.textContent = ({successful: 'Completed', pending: 'Pending', failed: 'Failed'}[row.status] || row.status || 'Status unavailable');
     const more = document.createElement('details');
@@ -723,6 +725,14 @@ function vtxoNode(tag, text, className) {
   if (className) node.className = className;
   return node;
 }
+function vtxoButton(label, className, action) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  if (className) button.className = className;
+  button.onclick = event => run(event.target, action);
+  return button;
+}
 function renderVtxos() {
   const {balance, rows, tip} = vtxoSnapshot;
   const nextKey = JSON.stringify([vtxoSnapshot, $('vtxo-filter').value]);
@@ -749,6 +759,34 @@ function renderVtxos() {
     const expiry = remaining === null ? 'Countdown unavailable' : remaining <=0 ? 'Expiry reached: review recovery immediately' : remaining.toLocaleString()+' blocks until expiry';
     card.append(top,vtxoNode('p',expiry,'expiry-label'),vtxoNode('p','Expires at block '+(Number.isSafeInteger(row.expiry_height)?row.expiry_height.toLocaleString():'unknown'),'hint'));
     if (remaining !== null && remaining >0 && remaining <=144) card.append(vtxoNode('p','Expiry is approaching. Check refresh and recovery status.','hint'));
+    const actions = vtxoNode('div','','vtxo-actions');
+    const coinId = String(row.id);
+    const coinAmount = Number.isSafeInteger(row.amount_sat) ? row.amount_sat.toLocaleString() + ' sats' : 'this coin';
+    const exitRow = (vtxoSnapshot.exits || []).find(item => String(item.vtxo_id) === coinId);
+    if (row.state?.type === 'spendable') {
+      actions.append(vtxoButton('Refresh this coin', 'secondary', async () => {
+        if (!await PaperclipReview.ask('Refresh only this coin (' + coinAmount + ')?\n\nIt joins the next round and gets a new expiry. The other coins stay where they are. The new round is priced at 1 sat/vB or more.')) return;
+        await mutate('wallet/refresh/vtxos', {vtxos: [coinId]});
+        await update();
+        status('Refresh requested for one coin.');
+      }));
+      actions.append(vtxoButton('Emergency exit this coin', '', async () => {
+        if (!await PaperclipReview.ask('Start emergency recovery of only this coin (' + coinAmount + ')?\n\nThis coin leaves Ark. On-chain fees and a timelock apply. The other coins stay in the wallet.')) return;
+        await mutate('exits/start/vtxos', {vtxos: [coinId]});
+        await update();
+        status('Emergency exit started for one coin.');
+      }));
+    }
+    if (exitRow?.state?.type === 'claimable') {
+      actions.append(vtxoButton('Claim this coin', '', async () => {
+        if (!await PaperclipReview.ask('Claim only this matured exit (' + coinAmount + ') to your on-chain wallet? Miner fees apply. The other exits stay unclaimed.')) return;
+        const address = await api('onchain/addresses/next', {});
+        await mutate('exits/claim/vtxos', {destination: address.address, vtxos: [coinId]});
+        await update();
+        status('Claim submitted for one coin.');
+      }));
+    }
+    if (actions.childElementCount) card.append(actions);
     const details = vtxoNode('details',''); details.dataset.vtxoId = String(row.id); details.open = openIds.has(String(row.id)); details.append(vtxoNode('summary','VTXO details'),vtxoNode('pre',JSON.stringify({id:row.id,policy:row.policy_type,exit_delay_blocks:row.exit_delta,exit_depth:row.exit_depth,chain_anchor:row.chain_anchor,state:row.state},null,2)));
     card.append(details);list.append(card);
   }

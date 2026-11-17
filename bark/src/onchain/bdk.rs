@@ -429,8 +429,37 @@ impl OnchainWallet {
 		destinations: &[(Address, Amount)],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<Txid> {
-		let pbst = self.prepare_tx(destinations, fee_rate).await?;
-		let tx = self.sign_psbt(pbst).await?.extract_tx()?;
+		self.send_many_inner(chain, destinations, fee_rate, false).await
+	}
+
+	/// Like [Self::send_many], but never spends an unconfirmed coin.
+	pub async fn send_many_confirmed(
+		&mut self,
+		chain: &ChainSource,
+		destinations: &[(Address, Amount)],
+		fee_rate: FeeRate,
+	) -> anyhow::Result<Txid> {
+		self.send_many_inner(chain, destinations, fee_rate, true).await
+	}
+
+	async fn send_many_inner(
+		&mut self,
+		chain: &ChainSource,
+		destinations: &[(Address, Amount)],
+		fee_rate: FeeRate,
+		confirmed_only: bool,
+	) -> anyhow::Result<Txid> {
+		let mut b = self.inner.build_tx();
+		b.ordering(TxOrdering::Untouched);
+		if confirmed_only {
+			b.exclude_unconfirmed();
+		}
+		for (dest, amount) in destinations {
+			b.add_recipient(dest.script_pubkey(), *amount);
+		}
+		b.fee_rate(fee_rate);
+		let psbt = b.finish().context("error building tx")?;
+		let tx = self.sign_psbt(psbt).await?.extract_tx()?;
 		let txid = tx.compute_txid();
 		self.record_broadcast_tx(tx.clone()).await?;
 		if let Err(e) = chain.broadcast_tx(&tx).await {

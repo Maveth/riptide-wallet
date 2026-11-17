@@ -259,8 +259,13 @@ pub async fn onchain_send_many(
 	}
 
 	let fee_rate = wallet.chain().fee_rates().await.regular;
-	let txid = cast_bdk_mut(&mut *onchain.write().await)?.send_many(wallet.chain(), &outputs, fee_rate).await
-		.context("Failed to send many onchain payments")?;
+	let mut onchain = onchain.write().await;
+	let wallet_onchain = cast_bdk_mut(&mut *onchain)?;
+	let txid = if body.confirmed_only {
+		wallet_onchain.send_many_confirmed(wallet.chain(), &outputs, fee_rate).await
+	} else {
+		wallet_onchain.send_many(wallet.chain(), &outputs, fee_rate).await
+	}.context("Failed to send many onchain payments")?;
 
 	Ok(axum::Json(bark_json::cli::onchain::Send { txid }))
 }

@@ -6,13 +6,13 @@ use std::sync::Arc;
 use bdk_wallet::{AddressInfo, TxBuilder, Utxo, Wallet, WeightedUtxo};
 use bdk_wallet::chain::{BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::coin_selection::{
-	decide_change, CoinSelectionAlgorithm, CoinSelectionResult, DefaultCoinSelectionAlgorithm,
+	decide_change, CoinSelectionAlgorithm, CoinSelectionResult,
 	Excess, InsufficientFunds,
 };
 use bdk_wallet::error::CreateTxError;
 use bitcoin::consensus::encode::{serialize, serialize_hex};
 use bitcoin::{
-	Amount, BlockHash, FeeRate, OutPoint, Script, Transaction, TxOut, Txid, Weight, Witness,
+	Amount, BlockHash, FeeRate, OutPoint, Script, Transaction, TxIn, TxOut, Txid, Weight, Witness,
 };
 use bitcoin::psbt::{ExtractTxError, Input};
 use log::debug;
@@ -161,6 +161,111 @@ impl TrustedBalance {
 /// The [bdk_wallet::KeychainKind] that is always used, because we only use a single keychain.
 pub const KEYCHAIN: bdk_wallet::KeychainKind = bdk_wallet::KeychainKind::External;
 
+
+/// Spend the smallest coin that covers the target on its own.
+///
+/// Exit fee payments used to draw a random confirmed coin. With only large coins
+/// in the wallet, that locked a multi-million-sat output as change until the hop
+/// confirmed. Required inputs, such as the fee anchor, are always included. When
+/// no single coin covers the remainder, coins are added from smallest to largest
+/// so a large coin is still only touched once the smaller ones fall short.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SmallestFirstCoinSelection;
+
+fn selected_input_weight(utxo: &WeightedUtxo) -> Weight {
+	TxIn::default()
+		.segwit_weight()
+		.checked_add(utxo.satisfaction_weight)
+		.expect("input weight fits")
+}
+
+impl CoinSelectionAlgorithm for SmallestFirstCoinSelection {
+	fn coin_select<R: RngCore>(
+		&self,
+		required_utxos: Vec<WeightedUtxo>,
+		mut optional_utxos: Vec<WeightedUtxo>,
+		fee_rate: FeeRate,
+		target_amount: Amount,
+		drain_script: &Script,
+		_: &mut R,
+	) -> Result<CoinSelectionResult, InsufficientFunds> {
+		optional_utxos.sort_unstable_by_key(|utxo| utxo.utxo.txout().value);
+
+		let mut required_amount = Amount::ZERO;
+		let mut required_weight = Weight::ZERO;
+		for utxo in &required_utxos {
+			required_amount += utxo.utxo.txout().value;
+			required_weight += selected_input_weight(utxo);
+		}
+
+		let covers = |extra_amount: Amount, extra_weight: Weight| {
+			let weight = required_weight + extra_weight;
+			required_amount + extra_amount >= target_amount + fee_rate * weight
+		};
+
+		let single_idx = optional_utxos.iter().position(|utxo| {
+			covers(utxo.utxo.txout().value, selected_input_weight(utxo))
+		});
+
+		// A coin below the target must not drag in the large coin when the
+		// other small coins add up. Only when those smaller coins fall short
+		// do we spend the one coin that covers on its own.
+		let selected = if let Some(idx) = single_idx {
+			let mut picked = required_utxos.clone();
+			let mut extra_amount = Amount::ZERO;
+			let mut extra_weight = Weight::ZERO;
+			for utxo in optional_utxos[..idx].iter().rev() {
+				picked.push(utxo.clone());
+				extra_amount += utxo.utxo.txout().value;
+				extra_weight += selected_input_weight(utxo);
+				if covers(extra_amount, extra_weight) {
+					break;
+				}
+			}
+			if covers(extra_amount, extra_weight) {
+				picked
+			} else {
+				let mut picked = required_utxos;
+				picked.push(optional_utxos[idx].clone());
+				picked
+			}
+		} else {
+			let mut picked = required_utxos;
+			let mut extra_amount = Amount::ZERO;
+			let mut extra_weight = Weight::ZERO;
+			for utxo in &optional_utxos {
+				picked.push(utxo.clone());
+				extra_amount += utxo.utxo.txout().value;
+				extra_weight += selected_input_weight(utxo);
+				if covers(extra_amount, extra_weight) {
+					break;
+				}
+			}
+			picked
+		};
+
+		let mut selected_amount = Amount::ZERO;
+		let mut total_weight = Weight::ZERO;
+		for utxo in &selected {
+			selected_amount += utxo.utxo.txout().value;
+			total_weight += selected_input_weight(utxo);
+		}
+		let fee_amount = fee_rate * total_weight;
+		let needed = target_amount + fee_amount;
+		if selected_amount < needed {
+			let available = required_amount + optional_utxos.iter()
+				.map(|utxo| utxo.utxo.txout().value)
+				.sum::<Amount>();
+			return Err(InsufficientFunds { needed, available });
+		}
+		let excess = decide_change(selected_amount - needed, fee_rate, drain_script);
+		Ok(CoinSelectionResult {
+			selected: selected.into_iter().map(|utxo| utxo.utxo).collect(),
+			fee_amount,
+			excess,
+		})
+	}
+}
 
 /// Coin selection wrapper that guarantees the transaction keeps a change (drain) output, so
 /// there is always a wallet-owned output left to CPFP. The selection is made to cover a non-dust
@@ -412,9 +517,10 @@ pub trait WalletExt: BorrowMut<Wallet> {
 		let mut fee_needed = extra_fee_needed;
 		for i in 0..100 {
 			// The change is this transaction's only output, so use a coin selection that
-			// guarantees it stays above the dust limit.
+			// guarantees it stays above the dust limit. Smallest-first keeps a fee
+			// coin of a few thousand sats from locking a multi-million-sat coin.
 			let mut b = wallet.build_tx()
-				.coin_selection(WithGuaranteedChange(DefaultCoinSelectionAlgorithm::default()));
+				.coin_selection(WithGuaranteedChange(SmallestFirstCoinSelection));
 			b.only_witness_utxo();
 			b.exclude_unconfirmed();
 			b.version(tx.version.0); // Preserve the parent relay profile.
@@ -462,6 +568,7 @@ pub trait WalletExt: BorrowMut<Wallet> {
 mod test {
 	use super::*;
 
+	use bdk_wallet::coin_selection::DefaultCoinSelectionAlgorithm;
 	use bdk_wallet::KeychainKind;
 	use bdk_wallet::chain::BlockId;
 	use bdk_wallet::test_utils::{
@@ -470,6 +577,7 @@ mod test {
 	};
 	use bitcoin::Network;
 	use bitcoin::hashes::Hash;
+	use bitcoin::ScriptBuf;
 
 	/// A wallet with two confirmed UTXOs of 1000 and 1001 sats.
 	fn two_utxo_wallet() -> (Wallet, OutPoint) {
@@ -623,6 +731,103 @@ mod test {
 			assert!(inputs.contains(op), "every confirmed UTXO must be spent");
 		}
 		assert!(inputs.contains(&unconfirmed), "unconfirmed UTXO must be pulled in");
+	}
+
+	fn wallet_with(amounts: &[u64]) -> (Wallet, Vec<OutPoint>) {
+		let mut wallet = Wallet::create_single(get_test_wpkh())
+			.network(Network::Regtest)
+			.create_wallet_no_persist()
+			.unwrap();
+		insert_checkpoint(&mut wallet, BlockId { height: 1_000, hash: BlockHash::all_zeros() });
+		let ops = amounts.iter().map(|sats| {
+			receive_output_in_latest_block(&mut wallet, Amount::from_sat(*sats))
+		}).collect();
+		(wallet, ops)
+	}
+
+	/// The zero-value anchor is required, same as a real fee child. A 25,000 sat
+	/// coin pays the fee. A coin below the target is left alone, and so is the
+	/// multi-million-sat coin.
+	#[test]
+	fn smallest_first_pays_the_fee_from_the_small_coin() {
+		let (mut wallet, ops) = wallet_with(&[3_953_440, 400, 25_000]);
+		let large = ops[0];
+		let too_small = ops[1];
+		let fee_coin = ops[2];
+		let change_spk = wallet.reveal_next_address(KeychainKind::External)
+			.address.script_pubkey();
+		let fee = Amount::from_sat(324);
+		let anchor = OutPoint { txid: Txid::all_zeros(), vout: 2 };
+
+		let mut b = wallet.build_tx()
+			.coin_selection(WithGuaranteedChange(SmallestFirstCoinSelection));
+		b.only_witness_utxo();
+		b.exclude_unconfirmed();
+		b.add_foreign_utxo(
+			anchor,
+			Input {
+				witness_utxo: Some(TxOut {
+					value: Amount::ZERO,
+					script_pubkey: ScriptBuf::from(vec![0x51]),
+				}),
+				..Default::default()
+			},
+			Weight::from_wu(3),
+		).expect("zero-value anchor");
+		b.drain_to(change_spk);
+		b.fee_absolute(fee);
+		let psbt = b.finish().expect("25_000 sat coin covers the fee");
+
+		let inputs: Vec<_> = psbt.unsigned_tx.input.iter().map(|i| i.previous_output).collect();
+		assert!(inputs.contains(&anchor));
+		assert!(inputs.contains(&fee_coin));
+		assert!(!inputs.contains(&large));
+		assert!(!inputs.contains(&too_small));
+		assert_eq!(inputs.len(), 2);
+		assert_eq!(psbt.unsigned_tx.output.len(), 1);
+		assert_eq!(psbt.unsigned_tx.output[0].value, Amount::from_sat(25_000) - fee);
+		assert_eq!(psbt.fee().unwrap(), fee);
+	}
+
+	/// When no single small coin covers the fee, the next-smallest coins are
+	/// added and the large coin stays unspent.
+	#[test]
+	fn smallest_first_combines_small_coins_before_the_large_one() {
+		// Distinct values: the test helper builds a no-input tx, so two equal
+		// payments to the same address would be the same transaction.
+		let (mut wallet, ops) = wallet_with(&[3_000_000, 10_000, 11_000]);
+		let large = ops[0];
+		let change_spk = wallet.reveal_next_address(KeychainKind::External)
+			.address.script_pubkey();
+		let dust = change_spk.minimal_non_dust();
+		let fee = Amount::from_sat(11_000) - dust + Amount::from_sat(1);
+		assert!(Amount::from_sat(11_000) < fee + dust, "one small coin must fall short");
+		assert!(Amount::from_sat(21_000) >= fee + dust, "two small coins must cover");
+
+		let anchor = OutPoint { txid: Txid::all_zeros(), vout: 2 };
+		let mut b = wallet.build_tx()
+			.coin_selection(WithGuaranteedChange(SmallestFirstCoinSelection));
+		b.only_witness_utxo();
+		b.add_foreign_utxo(
+			anchor,
+			Input {
+				witness_utxo: Some(TxOut {
+					value: Amount::ZERO,
+					script_pubkey: ScriptBuf::from(vec![0x51]),
+				}),
+				..Default::default()
+			},
+			Weight::from_wu(3),
+		).expect("zero-value anchor");
+		b.drain_to(change_spk);
+		b.fee_absolute(fee);
+		let psbt = b.finish().expect("two small coins cover the fee");
+
+		let inputs: Vec<_> = psbt.unsigned_tx.input.iter().map(|i| i.previous_output).collect();
+		assert!(inputs.contains(&anchor));
+		assert_eq!(inputs.len(), 3, "anchor plus both small coins");
+		assert!(!inputs.contains(&large));
+		assert_eq!(psbt.fee().unwrap(), fee);
 	}
 }
 

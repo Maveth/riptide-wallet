@@ -135,7 +135,7 @@ impl Wallet {
 		description: Option<String>,
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
-		let start = start_lightning_receive(self, amount, description, token, None).await?;
+		let start = start_lightning_receive(self, amount, description, None, token, None).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		start.invoice.into_bolt11().context("expected BOLT11 receive invoice")
 	}
@@ -170,7 +170,7 @@ impl Wallet {
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let start = start_lightning_receive(
-			self, amount, description, token, Some(claim_destination),
+			self, amount, description, None, token, Some(claim_destination),
 		).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		start.invoice.into_bolt11().context("expected BOLT11 receive invoice")

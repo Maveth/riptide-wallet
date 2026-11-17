@@ -673,6 +673,10 @@ pub struct OnchainSendManyRequest {
 	pub destinations: Vec<String>,
 	/// Sends the transaction immediately instead of waiting
 	pub immediate: Option<bool>,
+	/// Spend only confirmed coins. Unconfirmed change, including a fee child
+	/// that is still waiting to be mined, stays put.
+	#[serde(default)]
+	pub confirmed_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]

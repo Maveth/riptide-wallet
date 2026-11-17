@@ -901,15 +901,74 @@ pub(crate) async fn settle_lightning_send_payment(
 
 	wallet.inner.db.record_paid_invoice(payment_hash, preimage).await?;
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
+	let mut update = MovementUpdate::new().metadata([(
+		"payment_preimage".into(),
+		serde_json::to_value(preimage).expect("payment preimage can serde"),
+	)]);
+	if let Some(kept) = final_lightning_fee(wallet, payment_hash).await? {
+		if let Some(returned) = send.fee.to_sat().checked_sub(kept).filter(|n| *n > 0) {
+			let final_fee = Amount::from_sat(kept)
+				.checked_add(send.recovery_reserve)
+				.context("final lightning fee overflow")?;
+			update = update.fee(final_fee).metadata([
+				("fee_returned_sat".into(), serde_json::json!(returned)),
+				("fee_held_sat".into(), serde_json::json!(send.fee.to_sat())),
+			]);
+		}
+	}
 	wallet.inner.movements.finish_movement_with_update(
 		htlcs.movement_id,
 		MovementStatus::Successful,
-		MovementUpdate::new().metadata([(
-			"payment_preimage".into(),
-			serde_json::to_value(preimage).expect("payment preimage can serde"),
-		)]),
+		update,
 	).await?;
 
+	Ok(())
+}
+
+/// The fee the server kept after returning unused route hold to the tab.
+async fn final_lightning_fee(wallet: &Wallet, payment_hash: PaymentHash) -> anyhow::Result<Option<u64>> {
+	let (mut srv, _) = wallet.require_server().await?;
+	let response = srv.client.check_lightning_payment(protos::CheckLightningPaymentRequest {
+		hash: payment_hash.to_vec(),
+		wait: false,
+	}).await?.into_inner().payment_status;
+	Ok(match response {
+		Some(lightning_payment_status::PaymentStatus::Success(success)) => success.fee_sat,
+		_ => None,
+	})
+}
+
+/// A coin Lightning payment records the fee hold first. Once the server
+/// knows the route, the unused part is on the tab and the movement should
+/// show the fee that stayed.
+pub async fn repair_settled_lightning_fees(wallet: &Wallet) -> anyhow::Result<()> {
+	let movements = wallet.inner.db.get_all_movements().await?;
+	for movement in movements {
+		if !movement.subsystem.is_subsystem(Subsystem::LIGHTNING_SEND) {
+			continue;
+		}
+		if movement.status != MovementStatus::Successful {
+			continue;
+		}
+		if movement.metadata.get("fee_returned_sat").is_some() {
+			continue;
+		}
+		let Some(raw_hash) = movement.metadata.get("payment_hash") else { continue };
+		let hash: ark::lightning::PaymentHash = serde_json::from_value(raw_hash.clone())
+			.context("stored lightning payment hash")?;
+		let Some(kept) = final_lightning_fee(wallet, hash).await? else { continue };
+		let held = movement.offchain_fee.to_sat();
+		let Some(returned) = held.checked_sub(kept).filter(|n| *n > 0) else { continue };
+		wallet.inner.movements.update_movement(
+			movement.id,
+			MovementUpdate::new()
+				.fee(Amount::from_sat(kept))
+				.metadata([
+					("fee_returned_sat".into(), serde_json::json!(returned)),
+					("fee_held_sat".into(), serde_json::json!(held)),
+				]),
+		).await?;
+	}
 	Ok(())
 }
 

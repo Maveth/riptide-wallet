@@ -2,6 +2,7 @@
 //! Small Lightning invoices still go through Ark's normal Lightning send.
 
 use anyhow::Context;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::Keypair;
 use bitcoin::{Amount, Network};
 use server_rpc::protos;
@@ -213,11 +214,17 @@ impl Wallet {
 		if asked.amount_sat == 0 {
 			return Ok(());
 		}
-		let invoice = self.bolt11_invoice(
-			Amount::from_sat(asked.amount_sat),
-			Some(format!("Riptide {}", asked.amount_sat)),
-			None,
+		let metadata = if asked.metadata.is_empty() {
+			format!(r#"[["text/plain","Pay {} at Riptide Ark"]]"#, self.lightning_address().await?.split('@').next().unwrap_or("maveth"))
+		} else {
+			asked.metadata
+		};
+		let description_hash = sha256::Hash::hash(metadata.as_bytes()).to_byte_array().to_vec();
+		let start = crate::actions::lightning::receive::start_lightning_receive(
+			self, Amount::from_sat(asked.amount_sat), None, Some(description_hash), None, None,
 		).await?;
+		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
+		let invoice = start.invoice.into_bolt11().context("expected BOLT11 receive invoice")?;
 		let bolt11 = invoice.to_string();
 		let (mut srv, _) = self.require_server().await?;
 		srv.client.submit_lightning_address_invoice(protos::SubmitLightningAddressInvoiceRequest {
@@ -246,15 +253,39 @@ impl Wallet {
 		);
 	}
 
+	/// Keep a VTXO key in the tab set. A later read adds its balance to the total.
+	async fn remember_tab_index(&self, index: u32) -> anyhow::Result<()> {
+		let mut indexes = self.inner.db.tab_key_indexes().await?;
+		if indexes.contains(&index) {
+			return Ok(());
+		}
+		indexes.push(index);
+		self.inner.db.set_tab_key_indexes(&indexes).await?;
+		self.inner.db.set_tab_keys_scanned().await?;
+		Ok(())
+	}
+
 	/// Send 1,000 sats by Ark payment to the server. Change stays in the wallet.
-	/// The server credits the tab when it registers that output.
+	/// The server credits the tab on the key that spent the coin, so that key
+	/// stays in the total even when an earlier scan saw it at zero.
 	pub async fn fund_lightning_tab(&self) -> anyhow::Result<Amount> {
 		let (_, info) = self.require_server().await?;
 		let network = self.network().await?;
+		let policy = VtxoPolicy::new_pubkey(info.server_pubkey);
+		let change = self.inner.seed.to_mailbox_keypair().public_key();
+		if let Ok((inputs, _, _, _)) = self.plan_arkoor_payment(
+			Self::lightning_tab_chunk(), policy.clone(), change,
+		).await {
+			for input in &inputs {
+				if let Ok(Some((index, _))) = self.pubkey_keypair(&input.vtxo.policy().user_pubkey()).await {
+					self.remember_tab_index(index).await?;
+				}
+			}
+		}
 		let address = ark::Address::new(
 			network != Network::Bitcoin,
 			ArkId::from_server_pubkey(info.server_pubkey),
-			VtxoPolicy::new_pubkey(info.server_pubkey),
+			policy,
 			Vec::new(),
 		);
 		self.send_arkoor_payment(&address, Self::lightning_tab_chunk()).await

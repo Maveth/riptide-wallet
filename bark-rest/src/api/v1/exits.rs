@@ -273,10 +273,9 @@ pub async fn exit_start_vtxos(
 
 	wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await
 		.context("Failed to start exit for VTXOs")?;
-	let note = tab_forfeit_note(&wallet).await;
 
 	Ok(axum::Json(bark_json::web::ExitStartResponse {
-		message: format!("Exit started successfully.{note}"),
+		message: "Exit started successfully.".to_string(),
 	}))
 }
 
@@ -304,24 +303,10 @@ pub async fn exit_start_all(
 
 	wallet.exit_mgr().start_exit_for_entire_wallet().await
 		.context("Failed to start exit for entire wallet")?;
-	let note = tab_forfeit_note(&wallet).await;
 
 	Ok(axum::Json(bark_json::web::ExitStartResponse {
-		message: format!("Exit started successfully.{note}"),
+		message: "Exit started successfully.".to_string(),
 	}))
-}
-
-async fn tab_forfeit_note(wallet: &bark::Wallet) -> String {
-	match wallet.forfeit_lightning_tab().await {
-		Ok(amount) if amount.to_sat() > 0 => {
-			format!(" Lightning tab forfeited: {} sats.", amount.to_sat())
-		},
-		Ok(_) => String::new(),
-		Err(err) => {
-			tracing::warn!("lightning tab forfeit failed: {err:#}");
-			" The Lightning tab could not be forfeited. The exit is still starting.".to_string()
-		},
-	}
 }
 
 

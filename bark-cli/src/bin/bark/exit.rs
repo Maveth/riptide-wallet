@@ -255,9 +255,6 @@ pub async fn start_exit(
 
 		wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await?;
 	}
-	if let Err(err) = wallet.forfeit_lightning_tab().await {
-		warn!("Lightning tab was not forfeited: {err:#}");
-	}
 	Ok(())
 }
 

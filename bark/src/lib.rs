@@ -1666,6 +1666,9 @@ impl Wallet {
 		if let Err(err) = crate::actions::lightning::pay::repair_settled_tab_sends(self).await {
 			log::warn!("could not fill a settled tab payment amount: {:#}", err);
 		}
+		if let Err(err) = crate::actions::lightning::pay::repair_settled_lightning_fees(self).await {
+			log::warn!("could not record a settled lightning fee: {:#}", err);
+		}
 		Ok(self.inner.db.get_all_movements().await?)
 	}
 
