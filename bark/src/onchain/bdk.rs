@@ -9,7 +9,7 @@ use bdk_wallet::Wallet as BdkWallet;
 use bdk_wallet::coin_selection::DefaultCoinSelectionAlgorithm;
 use bdk_wallet::{Balance, KeychainKind, LocalOutput, TxBuilder, TxOrdering};
 use bitcoin::{
-	Address, Amount, FeeRate, Network, Psbt, Script, Sequence, Transaction, TxOut,
+	Address, Amount, FeeRate, Network, OutPoint, Psbt, Script, Sequence, Transaction, TxOut,
 	Txid, Weight, bip32, psbt,
 };
 use log::{debug, error, info, trace, warn};
@@ -218,12 +218,30 @@ impl OnchainWalletTrait for OnchainWallet {
 		destinations: &[(Address, Amount)],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<Psbt> {
+		self.prepare_tx_from(destinations, fee_rate, None, false).await
+	}
+
+	/// Build a payment. A named coin is the only input. With no named coin and
+	/// `confirmed_only`, unconfirmed coins are left alone.
+	pub(crate) async fn prepare_tx_from(
+		&mut self,
+		destinations: &[(Address, Amount)],
+		fee_rate: FeeRate,
+		from: Option<OutPoint>,
+		confirmed_only: bool,
+	) -> anyhow::Result<Psbt> {
 		let mut b = self.inner.build_tx();
 		b.ordering(TxOrdering::Untouched);
 		for (dest, amount) in destinations {
 			b.add_recipient(dest.script_pubkey(), *amount);
 		}
 		b.fee_rate(fee_rate);
+		if let Some(outpoint) = from {
+			b.add_utxo(outpoint).map_err(|err| anyhow!("that coin cannot be spent: {err}"))?;
+			b.manually_selected_only();
+		} else if confirmed_only {
+			b.exclude_unconfirmed();
+		}
 		b.finish().context("error building tx")
 	}
 

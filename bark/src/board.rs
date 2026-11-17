@@ -24,8 +24,18 @@ impl Wallet {
 	///
 	/// Returns an error if no onchain wallet is configured.
 	pub async fn board_amount(&self, amount: Amount) -> anyhow::Result<PendingBoard> {
+		self.board_amount_from(amount, None).await
+	}
+
+	/// Board `amount` from one coin, or from confirmed coins when `from` is empty.
+	///
+	/// An unconfirmed coin is spent only when the caller names it. A board must
+	/// not silently wait on a parent that may take a long time to mine.
+	pub async fn board_amount_from(
+		&self, amount: Amount, from: Option<OutPoint>,
+	) -> anyhow::Result<PendingBoard> {
 		let (user_keypair, _) = self.derive_store_next_keypair().await?;
-		self.board(Some(amount), user_keypair).await
+		self.board(Some(amount), user_keypair, from).await
 	}
 
 	/// Board a [ark::Vtxo] with all the funds in your onchain wallet.
@@ -33,7 +43,7 @@ impl Wallet {
 	/// Returns an error if no onchain wallet is configured.
 	pub async fn board_all(&self) -> anyhow::Result<PendingBoard> {
 		let (user_keypair, _) = self.derive_store_next_keypair().await?;
-		self.board(None, user_keypair).await
+		self.board(None, user_keypair, None).await
 	}
 
 	pub async fn pending_boards(&self) -> anyhow::Result<Vec<PendingBoard>> {
@@ -118,6 +128,7 @@ impl Wallet {
 		&self,
 		amount: Option<Amount>,
 		user_keypair: Keypair,
+		from: Option<OutPoint>,
 	) -> anyhow::Result<PendingBoard> {
 		let onchain = self.inner.onchain.as_ref()
 			.ok_or_else(|| anyhow!("no onchain wallet configured; cannot board"))?;
@@ -128,7 +139,8 @@ impl Wallet {
 		let signed_psbt = {
 			let mut wallet = onchain.write().await;
 			let board_psbt = if let Some(amount) = amount {
-				wallet.prepare_tx(&[(addr, amount)], fee_rate).await?
+				wallet.prepare_tx_from(&[(addr, amount)], fee_rate, from, true).await
+					.context("no confirmed coin covers this board. Pick a larger confirmed coin, or name an unconfirmed one knowing it waits on its parents.")?
 			} else {
 				wallet.prepare_drain_tx(addr, fee_rate).await?
 			};

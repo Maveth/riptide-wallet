@@ -134,6 +134,8 @@ async function updateBalances(sessionToken) {
   syncTabCard();
   $('chain-balance').textContent = Number.isSafeInteger(chain?.confirmed_sat) ? chain.confirmed_sat.toLocaleString() : 'Unavailable';
   renderOverviewPending(chain, chainTxs);
+  const chainUtxos = await api('onchain/utxos').catch(() => null);
+  fillBoardSources(Array.isArray(chainUtxos) ? chainUtxos : []);
   $('vtxos').textContent = JSON.stringify({balance, onchain: chain, vtxos}, null, 2);
   vtxoSnapshot = {balance: balance || {}, rows: Array.isArray(vtxos) ? vtxos : [], tip: Number.isSafeInteger(tip?.tip_height) ? tip.tip_height : null, exits: Array.isArray(exits) ? exits : []};
   renderVtxos();
@@ -578,11 +580,40 @@ $('deposit').onclick = event => run(event.target, async () => {
   PaperclipReceive.show('deposit-address', result.address, 'Receive on-chain XBT');
   status('Deposit address for ' + (network === 'bitcoin' ? 'XBT mainnet' : 'regtest') + '.');
 });
+function fillBoardSources(utxos) {
+  const select = $('board-source');
+  if (!select) return;
+  const current = select.value;
+  const rows = utxos.slice().sort((a, b) => {
+    const pendingA = a.confirmation_height == null ? 1 : 0;
+    const pendingB = b.confirmation_height == null ? 1 : 0;
+    if (pendingA !== pendingB) return pendingA - pendingB;
+    return (Number(b.amount_sat) || 0) - (Number(a.amount_sat) || 0);
+  });
+  select.replaceChildren();
+  const automatic = document.createElement('option');
+  automatic.value = '';
+  automatic.textContent = 'Confirmed coins only';
+  select.append(automatic);
+  for (const coin of rows) {
+    const option = document.createElement('option');
+    option.value = String(coin.outpoint || '');
+    const sats = Number(coin.amount_sat) || 0;
+    const state = coin.confirmation_height == null ? 'unconfirmed, may wait' : 'confirmed';
+    option.textContent = sats.toLocaleString() + ' sats · ' + state;
+    select.append(option);
+  }
+  if ([...select.options].some(option => option.value === current)) select.value = current;
+}
 $('board').onsubmit = event => { event.preventDefault(); run(event.submitter, async () => {
   const amount = Number($('board-amount').value);
   if (!Number.isSafeInteger(amount) || amount < 20000) throw new Error('Enter at least 20,000 whole sats.');
-  if (!await PaperclipReview.ask('Board ' + amount.toLocaleString() + ' sats on ' + network + '? Recovery reserves and miner fees apply.')) return;
-  await mutate('boards/board-amount', {amount_sat: amount}); await update();
+  const source = $('board-source') ? $('board-source').value : '';
+  const label = source && $('board-source').selectedOptions[0] ? $('board-source').selectedOptions[0].textContent : 'confirmed coins only';
+  if (!await PaperclipReview.ask('Board ' + amount.toLocaleString() + ' sats from ' + label + '? Recovery reserves and miner fees apply.')) return;
+  const body = {amount_sat: amount};
+  if (source) body.outpoint = source;
+  await mutate('boards/board-amount', body); await update();
   status('Board submitted. Wait for confirmations; do not submit again.');
 }); };
 $('withdraw').onclick = event => run(event.target, async () => {

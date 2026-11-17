@@ -488,6 +488,9 @@ pub struct BoardRequest {
 	/// this value, with any server-configured [BoardFees](crate::cli::fees::BoardFees) deducted, must be
 	/// >= [P2TR_DUST](bitcoin_ext::P2TR_DUST).
 	pub amount_sat: u64,
+	/// Spend this one coin, `txid:vout`. When omitted, only confirmed coins are used.
+	#[serde(default)]
+	pub outpoint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

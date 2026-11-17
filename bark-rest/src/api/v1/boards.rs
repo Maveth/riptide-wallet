@@ -6,7 +6,7 @@ use axum::{debug_handler, Json, Router};
 use bitcoin::Amount;
 use utoipa::OpenApi;
 
-use crate::error::{self, HandlerResult};
+use crate::error::{self, ContextExt, HandlerResult};
 use crate::ServerState;
 
 #[derive(OpenApi)]
@@ -53,7 +53,11 @@ pub async fn board_amount(
 ) -> HandlerResult<Json<bark_json::cli::PendingBoardInfo>> {
 	let wallet = state.require_wallet()?;
 	let amount = Amount::from_sat(body.amount_sat);
-	let board = wallet.board_amount(amount).await?;
+	let from = match body.outpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+		None => None,
+		Some(text) => Some(text.parse().badarg("outpoint must be txid:vout")?),
+	};
+	let board = wallet.board_amount_from(amount, from).await?;
 	Ok(axum::Json(board.into()))
 }
 
