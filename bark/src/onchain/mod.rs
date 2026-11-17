@@ -133,6 +133,16 @@ pub trait OnchainWalletTrait: std::any::Any + Send + Sync {
 		fee_rate: FeeRate,
 	) -> anyhow::Result<Psbt>;
 
+	/// Like prepare_tx. `from` is the only input when set. Otherwise
+	/// `confirmed_only` leaves unconfirmed coins unspent.
+	async fn prepare_tx_from(
+		&mut self,
+		destinations: &[(Address, Amount)],
+		fee_rate: FeeRate,
+		from: Option<OutPoint>,
+		confirmed_only: bool,
+	) -> anyhow::Result<Psbt>;
+
 	/// Prepare a [Transaction] for sending all wallet funds to the given destination
 	async fn prepare_drain_tx(
 		&mut self,

@@ -223,7 +223,7 @@ impl OnchainWalletTrait for OnchainWallet {
 
 	/// Build a payment. A named coin is the only input. With no named coin and
 	/// `confirmed_only`, unconfirmed coins are left alone.
-	pub(crate) async fn prepare_tx_from(
+	async fn prepare_tx_from(
 		&mut self,
 		destinations: &[(Address, Amount)],
 		fee_rate: FeeRate,
